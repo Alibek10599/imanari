@@ -44,3 +44,4 @@ getrandom.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "signal", "time", "io-util", "net", "sync"] }
 sqlx.workspace = true
 rlimit = "0.11"
+imanari-runtime = { path = "runtime" }

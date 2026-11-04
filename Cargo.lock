@@ -687,6 +687,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "getrandom",
+ "imanari-runtime",
  "rlimit",
  "serde",
  "serde_json",

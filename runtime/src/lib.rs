@@ -61,6 +61,7 @@ pub struct AppSpec {
     pub semantic_sha256: &'static str,
     pub schema: &'static [&'static str],
     pub schema_fingerprint: &'static str,
+    pub schema_shape: &'static str,
     pub database: &'static str,
     pub port: u16,
     pub request_limit_bytes: usize,
@@ -1012,6 +1013,118 @@ fn check_db_path(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntityShape {
+    pub name: String,
+    pub owner: String,
+    pub create: Vec<String>,
+    pub fields: Vec<FieldShape>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FieldShape {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: Value,
+    pub add: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationStep {
+    pub summary: String,
+    pub sql: Vec<String>,
+}
+
+fn type_label(t: &Value) -> String {
+    let name = t["name"].as_str().unwrap_or("?");
+    match (t["min_length"].as_i64(), t["max_length"].as_i64()) {
+        (Some(min), Some(max)) => format!("{name} {min}..{max}"),
+        _ => name.to_string(),
+    }
+}
+
+fn widens(old: &Value, new: &Value) -> bool {
+    let bounds = |t: &Value| {
+        (t["name"] == "Text").then(|| (t["min_length"].as_i64(), t["max_length"].as_i64()))
+    };
+    match (bounds(old), bounds(new)) {
+        (Some((Some(omin), Some(omax))), Some((Some(nmin), Some(nmax)))) => {
+            nmin <= omin && nmax >= omax
+        }
+        _ => false,
+    }
+}
+
+pub fn migration_plan(
+    old: &[EntityShape],
+    new: &[EntityShape],
+) -> Result<Vec<MigrationStep>, Vec<String>> {
+    let mut steps = Vec::new();
+    let mut blocked = Vec::new();
+    for o in old.iter().filter(|o| !new.iter().any(|n| n.name == o.name)) {
+        blocked.push(format!(
+            "entity {} was removed, which would drop its stored rows",
+            o.name
+        ));
+    }
+    for n in new {
+        let Some(o) = old.iter().find(|o| o.name == n.name) else {
+            steps.push(MigrationStep {
+                summary: format!("create entity {}", n.name),
+                sql: n.create.clone(),
+            });
+            continue;
+        };
+        if o.owner != n.owner {
+            blocked.push(format!(
+                "owner field of {} changed from {} to {}, which would change who owns stored rows",
+                n.name, o.owner, n.owner
+            ));
+        }
+        for of in o
+            .fields
+            .iter()
+            .filter(|f| !n.fields.iter().any(|g| g.name == f.name))
+        {
+            blocked.push(format!(
+                "field {}.{} was removed, which would drop its stored values",
+                n.name, of.name
+            ));
+        }
+        for nf in &n.fields {
+            let path = format!("{}.{}", n.name, nf.name);
+            match (o.fields.iter().find(|f| f.name == nf.name), &nf.add) {
+                (None, Some(sql)) => steps.push(MigrationStep {
+                    summary: format!("add field {path}"),
+                    sql: vec![sql.clone()],
+                }),
+                (None, None) => blocked.push(format!(
+                    "field {path} was added without a default, so existing rows have no value for it"
+                )),
+                (Some(of), _) if of.ty == nf.ty => {}
+                (Some(of), _) if widens(&of.ty, &nf.ty) => steps.push(MigrationStep {
+                    summary: format!(
+                        "widen {path} from {} to {}",
+                        type_label(&of.ty),
+                        type_label(&nf.ty)
+                    ),
+                    sql: Vec::new(),
+                }),
+                (Some(of), _) => blocked.push(format!(
+                    "type of {path} changed from {} to {}, which stored values may not satisfy",
+                    type_label(&of.ty),
+                    type_label(&nf.ty)
+                )),
+            }
+        }
+    }
+    if blocked.is_empty() {
+        Ok(steps)
+    } else {
+        Err(blocked)
+    }
+}
+
 pub enum OpenError {
     Config(String),
     MigrationRequired(String),
@@ -1075,29 +1188,88 @@ pub async fn open_database(
         for stmt in spec.schema {
             sqlx::query(stmt).execute(&mut *tx).await?;
         }
-        sqlx::query("INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_fingerprint', ?1), ('app', ?2)")
+        sqlx::query("INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_fingerprint', ?1), ('app', ?2), ('schema_shape', ?3)")
             .bind(spec.schema_fingerprint)
             .bind(spec.name)
+            .bind(spec.schema_shape)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         return Ok(pool);
     }
-    let stored: Option<String> = sqlx::query_scalar(
-        "SELECT \"value\" FROM \"_nari_meta\" WHERE \"key\" = 'schema_fingerprint'",
-    )
-    .fetch_optional(&pool)
-    .await?;
-    match stored {
-        Some(f) if f == spec.schema_fingerprint => Ok(pool),
-        Some(f) => Err(OpenError::MigrationRequired(format!(
-            "stored schema fingerprint {f} differs from compiled schema {}",
-            spec.schema_fingerprint
-        ))),
-        None => Err(OpenError::MigrationRequired(
+    let meta = |key: &'static str| {
+        sqlx::query_scalar::<_, String>("SELECT \"value\" FROM \"_nari_meta\" WHERE \"key\" = ?1")
+            .bind(key)
+            .fetch_optional(&pool)
+    };
+    let Some(stored) = meta("schema_fingerprint").await? else {
+        return Err(OpenError::MigrationRequired(
             "schema fingerprint missing".into(),
-        )),
+        ));
+    };
+    let stored_shape = meta("schema_shape").await?;
+    if stored == spec.schema_fingerprint {
+        if stored_shape.is_none() {
+            sqlx::query(
+                "INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_shape', ?1)",
+            )
+            .bind(spec.schema_shape)
+            .execute(&pool)
+            .await?;
+        }
+        return Ok(pool);
     }
+    let Some(old) = stored_shape else {
+        return Err(OpenError::MigrationRequired(format!(
+            "stored schema fingerprint {stored} differs from compiled schema {}, and the database predates recorded schema shapes; start the app once with the schema it was created with so the shape is recorded, then apply the change",
+            spec.schema_fingerprint
+        )));
+    };
+    let old: Vec<EntityShape> = serde_json::from_str(&old).map_err(|e| {
+        OpenError::MigrationRequired(format!("stored schema shape is unreadable: {e}"))
+    })?;
+    let new: Vec<EntityShape> = serde_json::from_str(spec.schema_shape)
+        .map_err(|e| OpenError::Config(format!("compiled schema shape is invalid: {e}")))?;
+    let steps = migration_plan(&old, &new)
+        .map_err(|blocked| OpenError::MigrationRequired(blocked.join("; ")))?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let claimed = sqlx::query(
+        "UPDATE \"_nari_meta\" SET \"value\" = ?1 WHERE \"key\" = 'schema_fingerprint' AND \"value\" = ?2",
+    )
+    .bind(spec.schema_fingerprint)
+    .bind(&stored)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() != 1 {
+        return Err(OpenError::MigrationRequired(
+            "schema fingerprint changed while migrating".into(),
+        ));
+    }
+    for sql in steps.iter().flat_map(|s| &s.sql) {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE \"_nari_meta\" SET \"value\" = ?1 WHERE \"key\" = 'schema_shape'")
+        .bind(spec.schema_shape)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS \"_nari_schema_history\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"from_fingerprint\" TEXT NOT NULL, \"to_fingerprint\" TEXT NOT NULL, \"steps\" TEXT NOT NULL, \"applied_ms\" INTEGER NOT NULL) STRICT")
+        .execute(&mut *tx)
+        .await?;
+    let summaries: Vec<&str> = steps.iter().map(|s| s.summary.as_str()).collect();
+    sqlx::query("INSERT INTO \"_nari_schema_history\" (\"from_fingerprint\", \"to_fingerprint\", \"steps\", \"applied_ms\") VALUES (?1, ?2, ?3, ?4)")
+        .bind(&stored)
+        .bind(spec.schema_fingerprint)
+        .bind(json!(summaries).to_string())
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if summaries.is_empty() {
+        log("schema fingerprint updated; no table changes were needed");
+    } else {
+        log(&format!("schema migrated: {}", summaries.join(", ")));
+    }
+    Ok(pool)
 }
 
 pub fn run(spec: &'static AppSpec) -> ExitCode {

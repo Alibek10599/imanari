@@ -152,7 +152,7 @@ Implemented:
 
 Unsupported in 0.1, each rejected with a diagnostic:
 
-- Mobile targets, production identity, PostgreSQL and migrations.
+- Mobile targets, production identity, PostgreSQL, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.
 - Public or anonymous access, list filters, and floats or other types beyond Text, Bool, UUID and Int.
 - `automatic_release = true`, and `plan` and `release`.

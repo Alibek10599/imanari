@@ -1,3 +1,4 @@
+use crate::codegen;
 use crate::ir::{self, Compiled, Graph};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
@@ -78,24 +79,24 @@ fn flatten(c: &Compiled) -> BTreeMap<String, (String, Json)> {
     out
 }
 
-fn category(kind: &str, key: &str) -> Option<(&'static str, bool)> {
+fn category(kind: &str, key: &str) -> Option<&'static str> {
     Some(match (kind, key) {
-        ("action", "") => ("capability", false),
-        ("action", "access") => ("access", false),
-        ("action", "kind" | "entity") => ("capability", false),
-        ("action", "id_input" | "revision_input") => ("input/output", false),
-        ("input", _) => ("input/output", false),
-        ("assignment", _) => ("behavior", false),
-        ("entity", "") => ("data migration", true),
-        ("entity", "owner_field") => ("access", true),
-        ("field", "" | "type") => ("data migration", true),
-        ("field", "default") => ("behavior", false),
-        ("screen" | "form" | "list" | "button" | "control", _) => ("ui", false),
-        ("runtime", _) => ("runtime", false),
-        ("targets", _) => ("runtime", false),
-        ("identity", _) => ("access", false),
-        ("recovery", _) => ("recovery authority", false),
-        ("repair", _) => ("repair authority", false),
+        ("action", "") => "capability",
+        ("action", "access") => "access",
+        ("action", "kind" | "entity") => "capability",
+        ("action", "id_input" | "revision_input") => "input/output",
+        ("input", _) => "input/output",
+        ("assignment", _) => "behavior",
+        ("entity", "") => "data migration",
+        ("entity", "owner_field") => "access",
+        ("field", "" | "type") => "data migration",
+        ("field", "default") => "behavior",
+        ("screen" | "form" | "list" | "button" | "control", _) => "ui",
+        ("runtime", _) => "runtime",
+        ("targets", _) => "runtime",
+        ("identity", _) => "access",
+        ("recovery", _) => "recovery authority",
+        ("repair", _) => "repair authority",
         _ => return None,
     })
 }
@@ -173,17 +174,10 @@ pub fn diff(base: &Compiled, cur: &Compiled) -> Json {
         let (old, new) = (b.get(id), c.get(id));
         let kind = old.or(new).map(|(k, _)| k.as_str()).unwrap_or("unknown");
         let mut push = |change: &str, key: &str, detail: String| {
-            let (cat, migration) = category(kind, key).unwrap_or(("unknown", true));
+            let cat = category(kind, key).unwrap_or("unknown");
             if cat == "unknown" {
                 full = true;
             }
-            let detail = if migration && cat == "data migration" {
-                format!(
-                    "{detail}; stored schema changes: existing databases stop with MIGRATION_REQUIRED"
-                )
-            } else {
-                detail
-            };
             changes.push(Change {
                 node: id.clone(),
                 kind: kind.into(),
@@ -264,14 +258,22 @@ pub fn diff(base: &Compiled, cur: &Compiled) -> Json {
     for ch in &changes {
         *summary.entry(ch.category.clone()).or_default() += 1;
     }
-    let migration = changes.iter().any(|c| c.category == "data migration");
+    let schema_changed = changes.iter().any(|c| c.category == "data migration");
+    let (automatic, blocked) = match imanari_runtime::migration_plan(
+        &codegen::schema_shape(&base.app),
+        &codegen::schema_shape(&cur.app),
+    ) {
+        Ok(steps) => (steps.into_iter().map(|s| s.summary).collect(), Vec::new()),
+        Err(blocked) => (Vec::new(), blocked),
+    };
     json!({
         "schema": "nari-diff/0.1",
         "base": { "source_sha256": base.source_sha256, "semantic_sha256": base.semantic_sha256 },
         "current": { "source_sha256": cur.source_sha256, "semantic_sha256": cur.semantic_sha256 },
         "behavior_changed": base.semantic_sha256 != cur.semantic_sha256,
-        "migration_required": migration,
-        "full_validation_required": full || migration,
+        "migration_required": !blocked.is_empty(),
+        "migration": { "automatic": automatic, "blocked": blocked },
+        "full_validation_required": full || schema_changed,
         "summary": summary,
         "changes": changes,
     })
@@ -306,8 +308,26 @@ pub fn render(d: &Json) -> String {
             out.push_str(&format!("    affects: {}\n", affected.join(", ")));
         }
     }
-    if d["migration_required"] == true {
-        out.push_str("data migration: existing databases will stop with MIGRATION_REQUIRED (0.1 has no automatic migrations)\n");
+    let list = |k: &str| -> Vec<String> {
+        d["migration"][k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    };
+    let (automatic, blocked) = (list("automatic"), list("blocked"));
+    if !automatic.is_empty() {
+        out.push_str(&format!(
+            "data migration: applied automatically on the next start: {}\n",
+            automatic.join(", ")
+        ));
+    }
+    if !blocked.is_empty() {
+        out.push_str(&format!(
+            "data migration: existing databases will stop with MIGRATION_REQUIRED: {}\n",
+            blocked.join("; ")
+        ));
     }
     if d["full_validation_required"] == true {
         out.push_str("full validation required: run `nari check` and `nari test`\n");

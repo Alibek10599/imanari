@@ -144,6 +144,7 @@ static SPEC: rt::AppSpec = rt::AppSpec {
         "CREATE INDEX \"entity_Task_owner\" ON \"entity_Task\" (\"owner\", \"id\")",
     ],
     schema_fingerprint: "fieldwork-baseline-v1",
+    schema_shape: "[]",
     database: ".nari/baseline.db",
     port: 7332,
     request_limit_bytes: 65536,

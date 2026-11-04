@@ -392,22 +392,55 @@ fn pagination_is_bounded_and_owner_scoped() {
 }
 
 #[test]
-fn incompatible_schema_stops_with_migration_required() {
+fn additive_schema_changes_migrate_and_destructive_ones_stop() {
     let b = fieldwork();
     let dir = scratch("migration");
     let db = dir.join("app.db");
     let (app, a, _) = app_with_sessions(b, &db, &[]);
     create(app.port, &a, "keep me", "m1");
     drop(app);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sql = |q: &'static str| {
+        rt.block_on(async {
+            let pool =
+                imanari_runtime::sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+                    .await
+                    .unwrap();
+            imanari_runtime::sqlx::query_scalar::<_, String>(q)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        })
+    };
+    sql("DELETE FROM \"_nari_meta\" WHERE \"key\" = 'schema_shape' RETURNING \"key\"");
     let changed = FIXTURE.replace(
         "    field completed {",
-        "    field notes {\n      type = Text;\n      default = \"\";\n    }\n\n    field completed {",
+        "    field notes {\n      type = Text;\n      default = \"it's new\";\n    }\n\n    field completed {",
     );
     let b2 = build("migration-v2", &changed);
-    let err = start(&b2, &db, &[]).err().expect("startup refuses");
+    let err = start(&b2, &db, &[])
+        .err()
+        .expect("a database without a stored shape refuses");
+    assert!(err.contains("predates recorded schema shapes"), "{err}");
+    drop(start(b, &db, &[]).expect("an identical fingerprint still starts"));
+    let (app2, a2, _) = app_with_sessions(&b2, &db, &[]);
+    let kept = items(app2.port, &a2);
+    assert_eq!(kept.len(), 1, "data kept");
+    assert_eq!(kept[0]["title"], "keep me");
+    assert_eq!(kept[0]["notes"], "it's new");
+    assert_eq!(create(app2.port, &a2, "after", "m2").status, 200);
+    drop(app2);
+    assert_eq!(
+        sql("SELECT \"steps\" FROM \"_nari_schema_history\""),
+        vec![r#"["add field Task.notes"]"#.to_string()]
+    );
+    let err = start(b, &db, &[])
+        .err()
+        .expect("removing a field refuses to start");
     assert!(err.contains("MIGRATION_REQUIRED"), "{err}");
-    let (app3, a3, _) = app_with_sessions(b, &db, &[]);
-    assert_eq!(items(app3.port, &a3).len(), 1, "data untouched");
+    assert!(err.contains("Task.notes was removed"), "{err}");
+    let (app3, a3, _) = app_with_sessions(&b2, &db, &[]);
+    assert_eq!(items(app3.port, &a3).len(), 2, "data untouched");
 }
 
 #[test]

@@ -345,3 +345,73 @@ fn relative_project_paths_resolve_to_absolute_directories() {
     assert!(located.dir.is_absolute());
     assert_eq!(located.dir, p.dir);
 }
+
+#[test]
+fn schema_changes_are_planned_as_automatic_or_blocked() {
+    let base = compiled(FIXTURE);
+    let with_notes = FIXTURE.replace(
+        "    field completed {",
+        "    field notes {\n      type = Text;\n      default = \"it's new\";\n    }\n\n    field completed {",
+    );
+    let d = imanari::diff::diff(&base, &compiled(&with_notes));
+    assert_eq!(d["migration"]["automatic"], json!(["add field Task.notes"]));
+    assert_eq!(d["migration_required"], false);
+    assert_eq!(d["full_validation_required"], true);
+    assert!(imanari::diff::render(&d).contains("applied automatically on the next start"));
+
+    let back = imanari::diff::diff(&compiled(&with_notes), &base);
+    assert_eq!(back["migration_required"], true);
+    assert_eq!(
+        back["migration"]["blocked"],
+        json!(["field Task.notes was removed, which would drop its stored values"])
+    );
+
+    let field_title =
+        "    field title {\n      type = Text;\n      min_length = 1;\n      max_length = 200;";
+    let widened = FIXTURE.replacen(field_title, &field_title.replace("200", "500"), 1);
+    let d = imanari::diff::diff(&base, &compiled(&widened));
+    assert_eq!(
+        d["migration"]["automatic"],
+        json!(["widen Task.title from Text 1..200 to Text 1..500"])
+    );
+    let narrowed = FIXTURE.replacen(field_title, &field_title.replace("200", "100"), 1);
+    let d = imanari::diff::diff(&base, &compiled(&narrowed));
+    assert_eq!(d["migration_required"], true);
+    assert!(
+        d["migration"]["blocked"][0]
+            .as_str()
+            .unwrap()
+            .contains("Task.title")
+    );
+
+    let old = imanari::codegen::schema_shape(&base.app);
+    let mut new = old.clone();
+    new[0].fields.push(imanari_runtime::FieldShape {
+        name: "due".into(),
+        ty: json!({ "name": "Int" }),
+        add: None,
+    });
+    let blocked = imanari_runtime::migration_plan(&old, &new).unwrap_err();
+    assert!(
+        blocked[0].contains("Task.due was added without a default"),
+        "{blocked:?}"
+    );
+    new[0].owner = "title".into();
+    assert_eq!(
+        imanari_runtime::migration_plan(&old, &new)
+            .unwrap_err()
+            .len(),
+        2
+    );
+    let mut extra = old.clone();
+    extra.push(imanari_runtime::EntityShape {
+        name: "Note".into(),
+        ..old[0].clone()
+    });
+    let steps = imanari_runtime::migration_plan(&old, &extra).unwrap();
+    assert_eq!(steps[0].summary, "create entity Note");
+    assert!(
+        imanari_runtime::migration_plan(&extra, &old).unwrap_err()[0]
+            .contains("entity Note was removed")
+    );
+}

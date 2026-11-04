@@ -1,6 +1,7 @@
 use crate::ir::{
     self, Action, ActionKind, App, ArgBinding, Binding, Compiled, Entity, Field, Literal, Type,
 };
+use imanari_runtime as rt;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 
@@ -51,37 +52,69 @@ fn sql_type(t: &Type) -> &'static str {
     }
 }
 
-pub fn schema(app: &App) -> (Vec<String>, String) {
-    let mut stmts = Vec::new();
-    for e in &app.entities {
-        let mut cols = vec![
-            format!("{} TEXT PRIMARY KEY NOT NULL", q("id")),
-            format!("{0} INTEGER NOT NULL CHECK ({0} >= 1)", q("revision")),
-        ];
-        for f in &e.fields {
-            let check = match &f.ty {
-                Type::Bool => format!(" CHECK ({} IN (0, 1))", q(&f.name)),
-                _ => String::new(),
-            };
-            cols.push(format!(
-                "{} {} NOT NULL{check}",
-                q(&f.name),
-                sql_type(&f.ty)
-            ));
-        }
-        stmts.push(format!(
-            "CREATE TABLE {} ({}) STRICT",
-            table(e),
-            cols.join(", ")
-        ));
-        stmts.push(format!(
+fn column(f: &Field) -> String {
+    let check = match &f.ty {
+        Type::Bool => format!(" CHECK ({} IN (0, 1))", q(&f.name)),
+        _ => String::new(),
+    };
+    format!("{} {} NOT NULL{check}", q(&f.name), sql_type(&f.ty))
+}
+
+fn sql_literal(l: &Literal) -> String {
+    match l {
+        Literal::Text(s) | Literal::Uuid(s) => format!("'{}'", s.replace('\'', "''")),
+        Literal::Bool(b) => i32::from(*b).to_string(),
+        Literal::Int(n) => n.to_string(),
+    }
+}
+
+fn entity_ddl(e: &Entity) -> Vec<String> {
+    let mut cols = vec![
+        format!("{} TEXT PRIMARY KEY NOT NULL", q("id")),
+        format!("{0} INTEGER NOT NULL CHECK ({0} >= 1)", q("revision")),
+    ];
+    cols.extend(e.fields.iter().map(column));
+    vec![
+        format!("CREATE TABLE {} ({}) STRICT", table(e), cols.join(", ")),
+        format!(
             "CREATE INDEX {} ON {} ({}, {})",
             q(&format!("entity_{}_owner", e.name)),
             table(e),
             q(&e.owner_field),
             q("id")
-        ));
-    }
+        ),
+    ]
+}
+
+pub fn schema_shape(app: &App) -> Vec<rt::EntityShape> {
+    app.entities
+        .iter()
+        .map(|e| rt::EntityShape {
+            name: e.name.clone(),
+            owner: e.owner_field.clone(),
+            create: entity_ddl(e),
+            fields: e
+                .fields
+                .iter()
+                .map(|f| rt::FieldShape {
+                    name: f.name.clone(),
+                    ty: ir::to_json(&f.ty),
+                    add: f.default.as_ref().map(|d| {
+                        format!(
+                            "ALTER TABLE {} ADD COLUMN {} DEFAULT {}",
+                            table(e),
+                            column(f),
+                            sql_literal(d)
+                        )
+                    }),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub fn schema(app: &App) -> (Vec<String>, String) {
+    let stmts: Vec<String> = app.entities.iter().flat_map(entity_ddl).collect();
     let shapes: Vec<Json> = app
         .entities
         .iter()
@@ -402,6 +435,13 @@ pub fn rust_main(
         }
         e.line(1, "],");
         e.line(1, &format!("schema_fingerprint: {},", rs(fingerprint)));
+        e.line(
+            1,
+            &format!(
+                "schema_shape: {},",
+                rs(&serde_json::to_string(&schema_shape(app)).unwrap_or_default())
+            ),
+        );
         e.line(1, &format!("database: {},", rs(&app.runtime.database)));
         e.line(1, &format!("port: {},", app.runtime.port));
         e.line(
