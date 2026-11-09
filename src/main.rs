@@ -583,6 +583,22 @@ fn status(p: &Project) -> CmdResult {
     if let Some(r) = s["detail"]["reason"].as_str() {
         human.push_str(&format!("\n  last transition: {r}"));
     }
+    for (name, a) in s["metrics"]["actions"].as_object().into_iter().flatten() {
+        let errors: u64 = a["by_status"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(code, _)| !code.starts_with('2'))
+            .filter_map(|(_, n)| n.as_u64())
+            .sum();
+        human.push_str(&format!(
+            "\n  {name}: {} requests, {errors} non-2xx, p95 <= {} us",
+            a["requests"], a["latency_us"]["p95_le"]
+        ));
+    }
+    if let Some(d) = s["metrics"]["dropped_events"].as_u64().filter(|d| *d > 0) {
+        human.push_str(&format!("\n  telemetry events dropped: {d}"));
+    }
     for i in s["recent_incidents"].as_array().into_iter().flatten() {
         human.push_str(&format!(
             "\n  {} {} -> {}",

@@ -95,7 +95,7 @@ The generated Rust calls the same `imanari-runtime` validators the handlers use.
 
 - **Isolation off macOS.** Repair isolation uses macOS Seatbelt. Elsewhere, `nari repair` runs proposal and static validation and reports `SANDBOX_UNAVAILABLE` (tested with `NARI_SANDBOX=none`), so the dynamic gate stays open on those platforms. A Linux backend (namespaces, seccomp or a container) is the missing prerequisite.
 - **Unenforced macOS limits.** Memory and process-count rlimits are not enforced by macOS in the sandbox. Wall-clock, CPU, file-size and open-file limits are, and the run phase denies `fork`.
-- **No telemetry pipeline.** 0.1 emits no telemetry, so §12's batched telemetry with dropped-event counters is not implemented. Incidents and recovery transitions are persisted before any action.
+- **Telemetry is local only.** Per-action counters and latency histograms sit behind a bounded queue with a dropped-event counter ([D17](decisions.md)) and are read through `nari status` or the owner-only `/_nari/metrics`. They are not exported or persisted across restarts. Incidents and recovery transitions are still persisted before any action.
 - **Incident links.** Incident `supersedes`/`revoked_by` fields exist but nothing sets them yet. No CLI exists to link decision records to nodes.
 - **File permissions.** SQLite WAL and SHM side files are created with the process umask. Only the main app and control database files are set to `0600`.
 - **Untested paths.** The readiness-timeout restart path and the `E_DEPENDENCIES` classification are implemented but not covered by automated tests.

@@ -60,7 +60,7 @@ The first `nari build` compiles Axum, SQLx and Tokio in release mode, which take
 | `nari test` | Run generated contract checks plus the protected tests in `acceptance/*.json`; failures become incidents |
 | `nari context ID [--max-bytes N]` | Write `.nari/context/<id>/context.md` and `manifest.json` |
 | `nari diff --base PATH` | Diff behavior and dependencies against another snapshot |
-| `nari status` / `nari incidents [--id ID]` | Show supervisor state and redacted incident records |
+| `nari status` / `nari incidents [--id ID]` | Show supervisor state, live per-action metrics, and redacted incident records |
 | `nari repair ID --proposer fixture\|file:PATH` | Run the isolated repair pipeline; never releases |
 | `nari apply-repair ID --candidate HASH` | Explicit local apply after rechecking hashes and protected tests |
 | `nari bench [--quick]` | Benchmark report in `.nari/bench/report.json` |

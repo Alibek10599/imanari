@@ -192,6 +192,63 @@ fn users_are_isolated_and_web_boundary_is_enforced() {
 }
 
 #[test]
+fn metrics_are_owner_only_bounded_and_payload_free() {
+    let b = fieldwork();
+    let dir = scratch("metrics");
+    let owner = "metrics-owner-token";
+    let (app, a, _) = app_with_sessions(b, &dir.join("app.db"), &[("NARI_OWNER_TOKEN", owner)]);
+    let port = app.port;
+    assert_eq!(create(port, &a, "metrics secret", "m1").status, 200);
+    assert_eq!(create(port, &a, "", "m2").status, 400);
+    items(port, &a);
+    for i in 0..3 {
+        let r = call(port, Some(&a), &format!("probe_{i}"), &json!({}), None).unwrap();
+        assert_eq!(r.status, 404);
+    }
+    let get = |token: &str| {
+        http::request(
+            port,
+            "GET",
+            "/_nari/metrics",
+            &[("X-Nari-Owner", token)],
+            b"",
+            TIMEOUT,
+        )
+        .unwrap()
+    };
+    assert_eq!(get("").status, 403);
+    assert_eq!(get("wrong").status, 403);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let m = loop {
+        let m = get(owner).json()["data"].clone();
+        if m["actions"]["(unknown)"]["requests"] == 3 || std::time::Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(m["schema"], "nari-metrics/0.1");
+    assert_eq!(m["dropped_events"], 0);
+    assert_eq!(m["queue_capacity"], 1024);
+    let actions = m["actions"].as_object().unwrap();
+    assert_eq!(
+        actions.keys().collect::<Vec<_>>(),
+        ["(unknown)", "create_task", "list_tasks"],
+        "unknown action names share one bucket"
+    );
+    assert_eq!(actions["create_task"]["requests"], 2);
+    assert_eq!(
+        actions["create_task"]["by_status"],
+        json!({ "200": 1, "400": 1 })
+    );
+    assert_eq!(actions["list_tasks"]["by_status"], json!({ "200": 1 }));
+    assert_eq!(actions["(unknown)"]["by_status"], json!({ "404": 3 }));
+    let text = m.to_string();
+    for secret in ["metrics secret", "probe_", a.actor.as_str(), owner] {
+        assert!(!text.contains(secret), "metrics leak {secret}");
+    }
+}
+
+#[test]
 fn bootstrap_token_is_single_use() {
     let b = fieldwork();
     let dir = scratch("bootstrap");
