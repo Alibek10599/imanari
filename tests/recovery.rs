@@ -169,6 +169,13 @@ fn crash_mid_request_restarts_and_preserves_committed_data() {
         status["detail"].get("owner_token").is_none(),
         "status never exposes the owner token"
     );
+    let metrics = &status["metrics"];
+    assert_eq!(metrics["instance"], status["detail"]["instance"]);
+    assert_eq!(
+        metrics["actions"]["create_task"]["by_status"],
+        json!({ "200": 1 })
+    );
+    assert_eq!(metrics["actions"]["list_tasks"]["requests"], 1);
     let (_, incidents) = nari_json(&dir, &["incidents"]);
     let inc = &incidents["incidents"][0];
     assert_eq!(inc["outcome"], "recovered_by_restart");

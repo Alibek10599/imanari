@@ -15,15 +15,16 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
 };
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore, mpsc, watch};
 
 pub const RUNTIME_INTERFACE: &str = "imanari-runtime/0.1";
 pub const MAX_SAFE_INT: i64 = 9_007_199_254_740_991;
@@ -34,6 +35,12 @@ const BOOTSTRAP_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT: usize = 100;
 const MUTATIONS_PER_MINUTE: usize = 60;
 const MAX_MUTATIONS_PER_MINUTE: usize = 1_000_000;
+const TELEMETRY_CAPACITY: usize = 1024;
+const TELEMETRY_BATCH: usize = 256;
+const LATENCY_BOUNDS_US: [u64; 17] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000, 10_000_000, 30_000_000,
+];
 pub const SEEDED_USERS: [(&str, &str, &str); 2] = [
     ("a", "User A", "00000000-0000-4000-8000-00000000000a"),
     ("b", "User B", "00000000-0000-4000-8000-00000000000b"),
@@ -341,6 +348,126 @@ struct Shared {
     fault: Option<(FaultPoint, String)>,
     mutations_per_minute: usize,
     shutdown: watch::Sender<bool>,
+    telemetry: Telemetry,
+}
+
+struct Event {
+    action: &'static str,
+    status: u16,
+    micros: u64,
+}
+
+#[derive(Default)]
+struct ActionStats {
+    requests: u64,
+    by_status: BTreeMap<u16, u64>,
+    buckets: [u64; LATENCY_BOUNDS_US.len() + 1],
+    max_us: u64,
+}
+
+impl ActionStats {
+    fn add(&mut self, e: &Event) {
+        self.requests += 1;
+        *self.by_status.entry(e.status).or_default() += 1;
+        let i = LATENCY_BOUNDS_US.partition_point(|b| *b < e.micros);
+        self.buckets[i] += 1;
+        self.max_us = self.max_us.max(e.micros);
+    }
+
+    fn quantile_le(&self, q: f64) -> u64 {
+        let rank = (self.requests as f64 * q).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (i, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                return LATENCY_BOUNDS_US.get(i).copied().unwrap_or(self.max_us);
+            }
+        }
+        self.max_us
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "requests": self.requests,
+            "by_status": self.by_status.iter().map(|(s, n)| (s.to_string(), json!(n))).collect::<Map<_, _>>(),
+            "latency_us": {
+                "p50_le": self.quantile_le(0.5),
+                "p95_le": self.quantile_le(0.95),
+                "max": self.max_us,
+                "buckets": self.buckets,
+            },
+        })
+    }
+}
+
+struct Telemetry {
+    tx: mpsc::Sender<Event>,
+    dropped: AtomicU64,
+    stats: Arc<Mutex<BTreeMap<&'static str, ActionStats>>>,
+    since_ms: i64,
+}
+
+impl Telemetry {
+    fn start(capacity: usize) -> (Telemetry, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let t = Telemetry {
+            tx,
+            dropped: AtomicU64::new(0),
+            stats: Arc::new(Mutex::new(BTreeMap::new())),
+            since_ms: now_ms(),
+        };
+        (t, rx)
+    }
+
+    fn record(&self, action: &'static str, status: u16, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        if self
+            .tx
+            .try_send(Event {
+                action,
+                status,
+                micros,
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let actions: Map<String, Value> = self
+            .stats
+            .lock()
+            .map(|s| {
+                s.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_json()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({
+            "since_ms": self.since_ms,
+            "queue_capacity": self.tx.max_capacity(),
+            "queued": self.tx.max_capacity() - self.tx.capacity(),
+            "dropped_events": self.dropped.load(Ordering::Relaxed),
+            "latency_bounds_us": LATENCY_BOUNDS_US,
+            "actions": actions,
+        })
+    }
+}
+
+async fn drain_telemetry(
+    mut rx: mpsc::Receiver<Event>,
+    stats: Arc<Mutex<BTreeMap<&'static str, ActionStats>>>,
+) {
+    let mut batch = Vec::with_capacity(TELEMETRY_BATCH);
+    while rx.recv_many(&mut batch, TELEMETRY_BATCH).await > 0 {
+        if let Ok(mut s) = stats.lock() {
+            for e in &batch {
+                s.entry(e.action).or_default().add(e);
+            }
+        }
+        batch.clear();
+    }
 }
 
 struct Session {
@@ -578,6 +705,12 @@ impl Shared {
         Ok(())
     }
 
+    fn owner(&self, h: &HeaderMap, state_changing: bool) -> bool {
+        let token = header_str(h, "x-nari-owner").unwrap_or_default();
+        self.guard(h, state_changing).is_ok()
+            && self.owner_token.as_deref().is_some_and(|t| same(t, token))
+    }
+
     fn session<'a>(&self, auth: &'a mut Auth, h: &HeaderMap, name: &str) -> Option<&'a Session> {
         let token = cookie(h, name)?;
         let expired = auth
@@ -682,11 +815,12 @@ async fn action_route(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let started = Instant::now();
     let request_id = new_uuid();
     let result = match app.permits.clone().try_acquire_owned() {
         Ok(permit) => {
             let bytes = drain(body, app.spec.request_limit_bytes).await;
-            let r = handle_action(app, &name, &headers, bytes).await;
+            let r = handle_action(app.clone(), &name, &headers, bytes).await;
             drop(permit);
             r
         }
@@ -700,6 +834,14 @@ async fn action_route(
         Ok(data) => json_response(200, json!({ "data": data, "request_id": request_id })),
         Err(e) => error_response(e, &request_id),
     };
+    let action = app
+        .spec
+        .actions
+        .iter()
+        .find(|a| a.name == name)
+        .map_or("(unknown)", |a| a.name);
+    app.telemetry
+        .record(action, resp.status().as_u16(), started.elapsed());
     secure_headers(resp)
 }
 
@@ -896,12 +1038,27 @@ async fn health_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Res
     ))
 }
 
+async fn metrics_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let rid = new_uuid();
+    if !app.owner(&headers, false) {
+        return secure_headers(error_response(
+            ApiError::new(403, "FORBIDDEN", "owner token required"),
+            &rid,
+        ));
+    }
+    let mut data = app.telemetry.snapshot();
+    data["schema"] = json!("nari-metrics/0.1");
+    data["instance"] = json!(app.instance);
+    data["source_sha256"] = json!(app.spec.source_sha256);
+    secure_headers(json_response(
+        200,
+        json!({ "data": data, "request_id": rid }),
+    ))
+}
+
 async fn shutdown_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let rid = new_uuid();
-    let token = header_str(&headers, "x-nari-owner").unwrap_or_default();
-    let ok = app.guard(&headers, true).is_ok()
-        && app.owner_token.as_deref().is_some_and(|t| same(t, token));
-    if !ok {
+    if !app.owner(&headers, true) {
         return secure_headers(error_response(
             ApiError::new(403, "FORBIDDEN", "owner token required"),
             &rid,
@@ -1356,6 +1513,8 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         .map(|(t, _)| t.clone())
         .unwrap_or_default();
     let (tx, mut rx) = watch::channel(false);
+    let (telemetry, events) = Telemetry::start(TELEMETRY_CAPACITY);
+    tokio::spawn(drain_telemetry(events, telemetry.stats.clone()));
     let shared = Arc::new(Shared {
         spec,
         db,
@@ -1374,6 +1533,7 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         fault,
         mutations_per_minute: cfg.mutations_per_minute,
         shutdown: tx,
+        telemetry,
     });
     let router = Router::new()
         .route("/api/actions/{name}", post(action_route))
@@ -1381,6 +1541,7 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         .route("/_nari/dev/select", post(select_route))
         .route("/_nari/session", get(session_route))
         .route("/_nari/health", get(health_route))
+        .route("/_nari/metrics", get(metrics_route))
         .route("/_nari/control/shutdown", post(shutdown_route))
         .fallback(static_route)
         .with_state(shared.clone());
@@ -1434,5 +1595,30 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
             log(&format!("server error: {e}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn telemetry_drops_when_full_and_aggregates_batches() {
+        let (t, rx) = Telemetry::start(2);
+        t.record("a", 200, Duration::from_micros(50));
+        t.record("a", 500, Duration::from_micros(3_000));
+        t.record("a", 200, Duration::from_micros(10));
+        let snap = t.snapshot();
+        assert_eq!(snap["dropped_events"], 1);
+        assert_eq!(snap["queued"], 2);
+        let stats = t.stats.clone();
+        drop(t);
+        drain_telemetry(rx, stats.clone()).await;
+        let a = stats.lock().unwrap()["a"].to_json();
+        assert_eq!(a["requests"], 2);
+        assert_eq!(a["by_status"], json!({ "200": 1, "500": 1 }));
+        assert_eq!(a["latency_us"]["p50_le"], 100);
+        assert_eq!(a["latency_us"]["p95_le"], 5_000);
+        assert_eq!(a["latency_us"]["max"], 3_000);
     }
 }

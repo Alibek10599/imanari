@@ -380,6 +380,24 @@ fn probe(port: u16) -> Option<Json> {
     .map(|r| r.json())
 }
 
+fn live_metrics(port: u16, token: &str) -> Option<Json> {
+    let health = probe(port)?;
+    if token.is_empty() || health["owner_sha256"] != ir::sha256_hex(token.as_bytes()).as_str() {
+        return None;
+    }
+    http::request(
+        port,
+        "GET",
+        "/_nari/metrics",
+        &[("X-Nari-Owner", token)],
+        b"",
+        Duration::from_millis(800),
+    )
+    .ok()
+    .filter(|r| r.status == 200)
+    .map(|r| r.json()["data"].clone())
+}
+
 pub async fn reconcile(ctl: &Control, emit: &dyn Fn(&str, Json)) -> Result<(), String> {
     let Some((state, info)) = ctl.state().await? else {
         return Ok(());
@@ -754,6 +772,25 @@ pub async fn status(p: &Project, c: Option<&Compiled>) -> Result<Json, String> {
     let state = ctl.state().await?;
     let window = c.map(|c| c.app.recovery.window_seconds).unwrap_or(60);
     let used = ctl.restarts_in_window(window).await?;
+    let endpoint = match &state {
+        Some((State::Healthy, info)) => info["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .map(|p| {
+                (
+                    p,
+                    info["owner_token"].as_str().unwrap_or_default().to_string(),
+                )
+            }),
+        _ => None,
+    };
+    let metrics = match endpoint {
+        Some((port, token)) => tokio::task::spawn_blocking(move || live_metrics(port, &token))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let (state_name, info) = match state {
         Some((s, mut info)) => {
             info.as_object_mut().map(|m| m.remove("owner_token"));
@@ -768,6 +805,7 @@ pub async fn status(p: &Project, c: Option<&Compiled>) -> Result<Json, String> {
         "restarts_in_window": used,
         "max_restarts": c.map(|c| c.app.recovery.max_restarts),
         "window_seconds": window,
+        "metrics": metrics,
         "recent_transitions": ctl.transitions(10).await?,
         "recent_incidents": ctl.incidents(None, 5).await?.iter().map(|i| json!({
             "incident_id": i["incident_id"], "kind": i["kind"], "failure_signature": i["failure_signature"], "outcome": i["outcome"],
