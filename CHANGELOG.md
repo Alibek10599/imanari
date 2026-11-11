@@ -8,7 +8,12 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 
 - Additive schema migrations. When an app starts against a database built from an older schema, new entities, new fields with a default, and widened text bounds are applied in one transaction and recorded in `_nari_schema_history`. Changes that would drop or reinterpret stored data still stop startup with `MIGRATION_REQUIRED`, and the message now names each change.
 - `nari diff` lists which schema changes apply automatically and which block startup (`migration.automatic` and `migration.blocked` in JSON).
+- PostgreSQL. Set `NARI_DATABASE_URL` to a `postgres://` URL and the same app binary stores its data in PostgreSQL, with startup migrations, idempotency receipts and revision checks that hold across several instances on one database. TLS is not built in yet, so `sslmode=require` is refused at startup.
 - Request telemetry. Apps count requests per action and status and keep a latency histogram, fed through a bounded queue that counts dropped events instead of blocking. `nari status` shows the numbers for the running worker, and the owner-only `GET /_nari/metrics` returns them as `nari-metrics/0.1` JSON.
+
+### Changed
+
+- Generated handlers call the runtime's query helpers (`Pool`, `Conn`, `Arg`, `Col`) instead of SQLx, and `AppSpec` no longer carries DDL: the runtime derives it from the schema shape for the open backend. Hand-written apps on `imanari-runtime` need the same change.
 
 ## [0.2.0] - 2026-11-04
 

@@ -26,11 +26,11 @@ fn rs(s: &str) -> String {
 }
 
 fn q(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+    rt::quote(ident)
 }
 
 fn table(e: &Entity) -> String {
-    q(&format!("entity_{}", e.name))
+    rt::table(&e.name)
 }
 
 fn columns(e: &Entity) -> Vec<&Field> {
@@ -45,68 +45,19 @@ fn column_list(e: &Entity) -> String {
         .join(", ")
 }
 
-fn sql_type(t: &Type) -> &'static str {
-    match t {
-        Type::Text { .. } | Type::Uuid => "TEXT",
-        Type::Bool | Type::Int => "INTEGER",
-    }
-}
-
-fn column(f: &Field) -> String {
-    let check = match &f.ty {
-        Type::Bool => format!(" CHECK ({} IN (0, 1))", q(&f.name)),
-        _ => String::new(),
-    };
-    format!("{} {} NOT NULL{check}", q(&f.name), sql_type(&f.ty))
-}
-
-fn sql_literal(l: &Literal) -> String {
-    match l {
-        Literal::Text(s) | Literal::Uuid(s) => format!("'{}'", s.replace('\'', "''")),
-        Literal::Bool(b) => i32::from(*b).to_string(),
-        Literal::Int(n) => n.to_string(),
-    }
-}
-
-fn entity_ddl(e: &Entity) -> Vec<String> {
-    let mut cols = vec![
-        format!("{} TEXT PRIMARY KEY NOT NULL", q("id")),
-        format!("{0} INTEGER NOT NULL CHECK ({0} >= 1)", q("revision")),
-    ];
-    cols.extend(e.fields.iter().map(column));
-    vec![
-        format!("CREATE TABLE {} ({}) STRICT", table(e), cols.join(", ")),
-        format!(
-            "CREATE INDEX {} ON {} ({}, {})",
-            q(&format!("entity_{}_owner", e.name)),
-            table(e),
-            q(&e.owner_field),
-            q("id")
-        ),
-    ]
-}
-
 pub fn schema_shape(app: &App) -> Vec<rt::EntityShape> {
     app.entities
         .iter()
         .map(|e| rt::EntityShape {
             name: e.name.clone(),
             owner: e.owner_field.clone(),
-            create: entity_ddl(e),
             fields: e
                 .fields
                 .iter()
                 .map(|f| rt::FieldShape {
                     name: f.name.clone(),
                     ty: ir::to_json(&f.ty),
-                    add: f.default.as_ref().map(|d| {
-                        format!(
-                            "ALTER TABLE {} ADD COLUMN {} DEFAULT {}",
-                            table(e),
-                            column(f),
-                            sql_literal(d)
-                        )
-                    }),
+                    default: f.default.as_ref().map(Literal::to_json),
                 })
                 .collect(),
         })
@@ -114,7 +65,10 @@ pub fn schema_shape(app: &App) -> Vec<rt::EntityShape> {
 }
 
 pub fn schema(app: &App) -> (Vec<String>, String) {
-    let stmts: Vec<String> = app.entities.iter().flat_map(entity_ddl).collect();
+    let stmts: Vec<String> = schema_shape(app)
+        .iter()
+        .flat_map(|e| rt::entity_ddl(e, rt::Dialect::Sqlite))
+        .collect();
     let shapes: Vec<Json> = app
         .entities
         .iter()
@@ -194,30 +148,33 @@ fn input_bind(i: &ir::Input, var: &str) -> String {
     }
 }
 
-fn row_fn(e: &mut Emitter, idx: usize, ent: &Entity) {
+fn cols_const(e: &mut Emitter, idx: usize, ent: &Entity) {
+    let cols: Vec<String> = columns(ent)
+        .iter()
+        .map(|f| {
+            let col = match f.ty {
+                Type::Text { .. } | Type::Uuid => "Text",
+                Type::Bool => "Bool",
+                Type::Int => "Int",
+            };
+            format!("({}, rt::Col::{col})", rs(&f.name))
+        })
+        .collect();
     e.line(
         0,
         &format!(
-            "fn row_{idx}(row: &rt::sqlx::sqlite::SqliteRow) -> Result<Json, rt::ApiError> {{"
+            "const COLS_{idx}: rt::Cols<'static> = &[{}];",
+            cols.join(", ")
         ),
     );
-    e.line(1, "let mut m = rt::serde_json::Map::new();");
-    for (i, f) in columns(ent).iter().enumerate() {
-        let getter = match f.ty {
-            Type::Text { .. } | Type::Uuid => "col_text",
-            Type::Bool => "col_bool",
-            Type::Int => "col_int",
-        };
-        e.line(
-            1,
-            &format!(
-                "m.insert({}.to_string(), rt::{getter}(row, {i})?);",
-                rs(&f.name)
-            ),
-        );
-    }
-    e.line(1, "Ok(Json::Object(m))");
-    e.line(0, "}");
+}
+
+fn args(binds: &[String]) -> String {
+    let args: Vec<String> = binds
+        .iter()
+        .map(|b| format!("rt::Arg::from({b})"))
+        .collect();
+    format!("&[{}]", args.join(", "))
 }
 
 fn action_fn(e: &mut Emitter, idx: usize, app: &App, a: &Action, ent_idx: usize) {
@@ -236,20 +193,25 @@ fn action_fn(e: &mut Emitter, idx: usize, app: &App, a: &Action, ent_idx: usize)
     e.line(1, "Box::pin(async move {");
     if a.kind == ActionKind::List {
         let sql = format!(
-            "SELECT {cols} FROM {} WHERE {} = ?1 AND (?2 IS NULL OR {} > ?2) ORDER BY {} ASC LIMIT ?3",
+            "SELECT {cols} FROM {} WHERE {} = $1 AND ($2 IS NULL OR {} > $2) ORDER BY {} ASC LIMIT $3",
             table(ent),
             q(&ent.owner_field),
             q("id"),
             q("id")
         );
         e.line(2, "let (limit, after) = input.page()?;");
-        e.line(2, &format!("let rows = rt::sqlx::query({})", rs(&sql)));
-        e.line(3, ".bind(ctx.actor())");
-        e.line(3, ".bind(after)");
-        e.line(3, ".bind(limit + 1)");
-        e.line(3, ".fetch_all(ctx.db())");
+        e.line(2, "let rows = ctx");
+        e.line(3, ".db()");
+        e.line(3, &format!(".fetch_all({},", rs(&sql)));
+        e.line(
+            4,
+            &format!(
+                "{}, COLS_{ent_idx})",
+                args(&["ctx.actor()".into(), "after".into(), "limit + 1".into()])
+            ),
+        );
         e.line(3, ".await?;");
-        e.line(2, &format!("rt::page(rows, limit, row_{ent_idx})"));
+        e.line(2, "rt::page(rows, limit)");
         e.line(1, "})");
         e.line(0, "}");
         return;
@@ -324,29 +286,28 @@ fn action_fn(e: &mut Emitter, idx: usize, app: &App, a: &Action, ent_idx: usize)
                 None => binds.push(literal_bind(f.default.as_ref().expect("validated default"))),
             }
         }
-        let params: Vec<String> = (1..=binds.len()).map(|i| format!("?{i}")).collect();
+        let params: Vec<String> = (1..=binds.len()).map(|i| format!("${i}")).collect();
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({}) RETURNING {cols}",
             table(ent),
             col_names.join(", "),
             params.join(", ")
         );
-        e.line(2, &format!("let row = rt::sqlx::query({})", rs(&sql)));
-        for b in binds {
-            e.line(3, &format!(".bind({b})"));
-        }
-        e.line(3, ".fetch_one(tx.conn())");
+        e.line(2, "let data = tx");
+        e.line(3, ".conn()");
+        e.line(3, &format!(".fetch_one({},", rs(&sql)));
+        e.line(4, &format!("{}, COLS_{ent_idx})", args(&binds)));
         e.line(3, ".await?;");
     } else {
         let mut sets = Vec::new();
         let mut binds = Vec::new();
         for (i, s) in a.set.iter().enumerate() {
-            sets.push(format!("{} = ?{}", q(&s.field), i + 1));
+            sets.push(format!("{} = ${}", q(&s.field), i + 1));
             binds.push(bind_for(&s.binding));
         }
         let n = binds.len();
         let sql = format!(
-            "UPDATE {} SET {}, {rev} = {rev} + 1 WHERE {} = ?{} AND {} = ?{} AND {rev} = ?{} AND {rev} < {} RETURNING {cols}",
+            "UPDATE {} SET {}, {rev} = {rev} + 1 WHERE {} = ${} AND {} = ${} AND {rev} = ${} AND {rev} < {} RETURNING {cols}",
             table(ent),
             sets.join(", "),
             q("id"),
@@ -362,23 +323,24 @@ fn action_fn(e: &mut Emitter, idx: usize, app: &App, a: &Action, ent_idx: usize)
             .revision_input
             .as_deref()
             .expect("validated revision input")];
-        e.line(2, &format!("let row = rt::sqlx::query({})", rs(&sql)));
-        for b in binds {
-            e.line(3, &format!(".bind({b})"));
-        }
-        e.line(3, &format!(".bind({id_var}.clone())"));
-        e.line(3, ".bind(ctx.actor())");
-        e.line(3, &format!(".bind({rev_var})"));
-        e.line(3, ".fetch_optional(tx.conn())");
+        binds.extend([
+            format!("{id_var}.clone()"),
+            "ctx.actor()".into(),
+            rev_var.to_string(),
+        ]);
+        e.line(2, "let row = tx");
+        e.line(3, ".conn()");
+        e.line(3, &format!(".fetch_optional({},", rs(&sql)));
+        e.line(4, &format!("{}, COLS_{ent_idx})", args(&binds)));
         e.line(3, ".await?;");
         let exists = format!(
-            "SELECT {} FROM {} WHERE {} = ?1 AND {} = ?2",
+            "SELECT {} FROM {} WHERE {} = $1 AND {} = $2",
             q("revision"),
             table(ent),
             q("id"),
             q(&ent.owner_field)
         );
-        e.line(2, "let Some(row) = row else {");
+        e.line(2, "let Some(data) = row else {");
         e.line(
             3,
             &format!(
@@ -388,17 +350,12 @@ fn action_fn(e: &mut Emitter, idx: usize, app: &App, a: &Action, ent_idx: usize)
         );
         e.line(2, "};");
     }
-    e.line(2, &format!("let data = row_{ent_idx}(&row)?;"));
     e.line(2, "ctx.commit_mutation(tx, data).await");
     e.line(1, "})");
     e.line(0, "}");
 }
 
-pub fn rust_main(
-    c: &Compiled,
-    schema_stmts: &[String],
-    fingerprint: &str,
-) -> (String, Vec<Region>) {
+pub fn rust_main(c: &Compiled, fingerprint: &str) -> (String, Vec<Region>) {
     let app = &c.app;
     let mut e = Emitter {
         out: String::new(),
@@ -412,7 +369,7 @@ pub fn rust_main(
     e.line(0, "use rt::serde_json::Value as Json;");
     e.line(0, "");
     for (i, ent) in app.entities.iter().enumerate() {
-        e.region(&ent.id, |e| row_fn(e, i, ent));
+        e.region(&ent.id, |e| cols_const(e, i, ent));
         e.line(0, "");
     }
     for (i, a) in app.actions.iter().enumerate() {
@@ -429,11 +386,6 @@ pub fn rust_main(
         e.line(1, &format!("name: {},", rs(&app.name)));
         e.line(1, &format!("source_sha256: {},", rs(&c.source_sha256)));
         e.line(1, &format!("semantic_sha256: {},", rs(&c.semantic_sha256)));
-        e.line(1, "schema: &[");
-        for s in schema_stmts {
-            e.line(2, &format!("{},", rs(s)));
-        }
-        e.line(1, "],");
         e.line(1, &format!("schema_fingerprint: {},", rs(fingerprint)));
         e.line(
             1,
@@ -643,8 +595,8 @@ pub const RUNTIME_MANIFEST: &str = include_str!("../runtime/Cargo.toml");
 pub const RUNTIME_SOURCE: &str = include_str!("../runtime/src/lib.rs");
 
 pub fn generate(c: &Compiled, package: &str) -> Generated {
-    let (stmts, fingerprint) = schema(&c.app);
-    let (main_rs, regions) = rust_main(c, &stmts, &fingerprint);
+    let (_, fingerprint) = schema(&c.app);
+    let (main_rs, regions) = rust_main(c, &fingerprint);
     let mut files = BTreeMap::new();
     files.insert("app/src/main.rs".into(), main_rs);
     files.insert(
