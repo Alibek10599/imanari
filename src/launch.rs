@@ -42,6 +42,7 @@ impl AppProcess {
             .env("NARI_DATABASE", &o.database)
             .env("NARI_PORT", o.port.to_string())
             .env_remove("NARI_FAULT")
+            .env_remove("NARI_DATABASE_URL")
             .env_remove("NARI_OWNER_TOKEN")
             .env_remove("NARI_SUPERVISED")
             .stdin(Stdio::null())

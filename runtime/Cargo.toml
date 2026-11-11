@@ -11,7 +11,7 @@ description = "Runtime interface linked by generated Imanari applications"
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-std", "io-util"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "postgres", "runtime-tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

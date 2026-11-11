@@ -2,7 +2,7 @@
 
 use imanari_runtime as rt;
 use rt::serde_json::{self, Value};
-use rt::sqlx::{self, Row, sqlite::SqliteRow};
+use rt::sqlx::{self, Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -44,6 +44,20 @@ struct CompleteTask {
     revision: i64,
 }
 
+fn sqlite_pool(ctx: &rt::Ctx) -> Result<&SqlitePool, rt::ApiError> {
+    match ctx.db() {
+        rt::Pool::Sqlite(p) => Ok(p),
+        rt::Pool::Postgres(_) => Err(rt::ApiError::new(500, "INTERNAL", "baseline needs SQLite")),
+    }
+}
+
+fn sqlite_tx(tx: &mut rt::Tx) -> Result<&mut SqliteConnection, rt::ApiError> {
+    match tx.conn() {
+        rt::Conn::Sqlite(c) => Ok(&mut **c),
+        rt::Conn::Postgres(_) => Err(rt::ApiError::new(500, "INTERNAL", "baseline needs SQLite")),
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(input: rt::Input) -> Result<T, rt::ApiError> {
     serde_json::from_value(input.into_value())
         .map_err(|e| rt::ApiError::new(400, "INVALID_INPUT", e.to_string()))
@@ -66,7 +80,7 @@ fn create_task(ctx: rt::Ctx, input: rt::Input) -> rt::HandlerFuture {
             .bind(rt::new_uuid())
             .bind(ctx.actor())
             .bind(&req.title)
-            .fetch_one(tx.conn())
+            .fetch_one(sqlite_tx(&mut tx)?)
             .await?;
         let data = Task::json(&row)?;
         ctx.commit_mutation(tx, data).await
@@ -80,9 +94,10 @@ fn list_tasks(ctx: rt::Ctx, input: rt::Input) -> rt::HandlerFuture {
             .bind(ctx.actor())
             .bind(after)
             .bind(limit + 1)
-            .fetch_all(ctx.db())
+            .fetch_all(sqlite_pool(&ctx)?)
             .await?;
-        rt::page(rows, limit, Task::json)
+        let items = rows.iter().map(Task::json).collect::<Result<_, _>>()?;
+        rt::page(items, limit)
     })
 }
 
@@ -116,7 +131,7 @@ fn complete_task(ctx: rt::Ctx, input: rt::Input) -> rt::HandlerFuture {
             .bind(&req.id)
             .bind(ctx.actor())
             .bind(req.revision)
-            .fetch_optional(tx.conn())
+            .fetch_optional(sqlite_tx(&mut tx)?)
             .await?;
         match row {
             Some(row) => {
@@ -139,12 +154,8 @@ static SPEC: rt::AppSpec = rt::AppSpec {
     name: "fieldwork-baseline",
     source_sha256: "hand-written",
     semantic_sha256: "hand-written",
-    schema: &[
-        "CREATE TABLE \"entity_Task\" (\"id\" TEXT PRIMARY KEY NOT NULL, \"revision\" INTEGER NOT NULL CHECK (\"revision\" >= 1), \"completed\" INTEGER NOT NULL CHECK (\"completed\" IN (0, 1)), \"owner\" TEXT NOT NULL, \"title\" TEXT NOT NULL) STRICT",
-        "CREATE INDEX \"entity_Task_owner\" ON \"entity_Task\" (\"owner\", \"id\")",
-    ],
     schema_fingerprint: "fieldwork-baseline-v1",
-    schema_shape: "[]",
+    schema_shape: r#"[{"name":"Task","owner":"owner","fields":[{"name":"completed","type":{"name":"Bool"}},{"name":"owner","type":{"name":"UUID"}},{"name":"title","type":{"max_length":200,"min_length":1,"name":"Text"}}]}]"#,
     database: ".nari/baseline.db",
     port: 7332,
     request_limit_bytes: 65536,

@@ -1,6 +1,6 @@
 # Imanari
 
-Imanari is a small, human-readable system language. A `.nari` file declares data, owner-scoped actions, screens, runtime limits, recovery policy, and repair authority. The compiler turns it into a native Rust backend (Axum + SQLx/SQLite), a browser UI built from native controls, a typed IR, and a dependency graph. Agents work from bounded, versioned context bundles instead of reconstructing the project from chat history.
+Imanari is a small, human-readable system language. A `.nari` file declares data, owner-scoped actions, screens, runtime limits, recovery policy, and repair authority. The compiler turns it into a native Rust backend (Axum + SQLx on SQLite or PostgreSQL), a browser UI built from native controls, a typed IR, and a dependency graph. Agents work from bounded, versioned context bundles instead of reconstructing the project from chat history.
 
 Imanari 0.1 is a developer preview. [docs/spec.md](docs/spec.md) is the normative contract and [examples/fieldwork](examples/fieldwork) the reference app. [docs/progress.md](docs/progress.md) maps every acceptance item to its evidence, and [docs/decisions.md](docs/decisions.md) records spec clarifications.
 
@@ -107,10 +107,12 @@ nari --project /tmp/fw apply-repair <incident> --candidate <hash>
 | --- | --- |
 | `NARI_TARGET_DIR` | Cargo target dir for generated apps (default `.nari/build/target`) |
 | `NARI_PORT`, `NARI_DATABASE` | Trusted operator override of the declared port (0 picks a free one) and the database path |
+| `NARI_DATABASE_URL` | A `postgres://` URL. The app then uses PostgreSQL instead of the SQLite file. TLS is not built in yet, so `sslmode=require` fails at startup |
 | `NARI_FAULT` | Dev and test fault injection: `crash_on_start`, `crash_on_request:<action>`, `crash_before_commit:<action>`, `crash_after_commit:<action>` |
 | `NARI_MUTATIONS_PER_MINUTE` | Operator override of the per-actor mutation limit (default 60); the check still runs |
 | `NARI_SANDBOX=none` | Force the no-isolation path (repair reports `SANDBOX_UNAVAILABLE`) |
 | `NARI_CHROMIUM`, `NARI_REQUIRE_BROWSER` | Browser for the journey test; with `NARI_REQUIRE_BROWSER` set, a missing browser fails the test instead of skipping it |
+| `NARI_PG_BIN`, `NARI_REQUIRE_POSTGRES` | Directory holding `initdb` for the PostgreSQL tests (found on `PATH` or in Homebrew and Debian locations otherwise); with `NARI_REQUIRE_POSTGRES` set, a missing PostgreSQL fails the tests instead of skipping them |
 
 ## Tests
 
@@ -119,7 +121,7 @@ cargo test --workspace     # language, runtime, browser, agent workflow, recover
 nari bench                # full benchmark (release CLI recommended: target/release/nari)
 ```
 
-The suites build generated apps into `target/nari-apps` and run real HTTP against real SQLite, real worker processes, and real Seatbelt sandboxes. Nothing in them is mocked.
+The suites build generated apps into `target/nari-apps` and run real HTTP against real SQLite, a throwaway PostgreSQL cluster, real worker processes, and real Seatbelt sandboxes. Nothing in them is mocked.
 
 ## Layout
 
@@ -152,7 +154,7 @@ Implemented:
 
 Unsupported in 0.1, each rejected with a diagnostic:
 
-- Mobile targets, production identity, PostgreSQL, and migrations that remove, rename or retype stored data.
+- Mobile targets, production identity, TLS connections to PostgreSQL, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.
 - Public or anonymous access, list filters, and floats or other types beyond Text, Bool, UUID and Int.
 - `automatic_release = true`, and `plan` and `release`.

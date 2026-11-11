@@ -11,10 +11,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
-};
-use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::{Postgres, Row, Sqlite, Transaction};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write;
@@ -66,7 +65,6 @@ pub struct AppSpec {
     pub name: &'static str,
     pub source_sha256: &'static str,
     pub semantic_sha256: &'static str,
-    pub schema: &'static [&'static str],
     pub schema_fingerprint: &'static str,
     pub schema_shape: &'static str,
     pub database: &'static str,
@@ -112,8 +110,11 @@ impl ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         let busy = match &e {
-            sqlx::Error::PoolTimedOut => true,
-            sqlx::Error::Database(d) => matches!(d.code().as_deref(), Some("5" | "6" | "517")),
+            sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) => true,
+            sqlx::Error::Database(d) => matches!(
+                d.code().as_deref(),
+                Some("5" | "6" | "517" | "40001" | "40P01" | "55P03" | "53300" | "57P01")
+            ),
             _ => false,
         };
         if busy {
@@ -295,13 +296,9 @@ pub fn input_hash(action: &str, fields: &[(&str, Value)]) -> String {
     sha256_hex(canonical.as_bytes())
 }
 
-pub fn page<F>(mut rows: Vec<SqliteRow>, limit: i64, convert: F) -> Result<Value, ApiError>
-where
-    F: Fn(&SqliteRow) -> Result<Value, ApiError>,
-{
-    let more = rows.len() as i64 > limit;
-    rows.truncate(limit as usize);
-    let items: Vec<Value> = rows.iter().map(convert).collect::<Result<_, _>>()?;
+pub fn page(mut items: Vec<Value>, limit: i64) -> Result<Value, ApiError> {
+    let more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
     let next = if more {
         items
             .last()
@@ -314,16 +311,208 @@ where
     Ok(json!({ "items": items, "next_cursor": next }))
 }
 
-pub fn col_text(row: &SqliteRow, i: usize) -> Result<Value, ApiError> {
-    Ok(Value::String(row.try_get::<String, _>(i)?))
+pub enum Arg {
+    Text(String),
+    Int(i64),
+    Null,
 }
 
-pub fn col_int(row: &SqliteRow, i: usize) -> Result<Value, ApiError> {
-    Ok(Value::from(row.try_get::<i64, _>(i)?))
+impl From<&str> for Arg {
+    fn from(v: &str) -> Self {
+        Arg::Text(v.to_string())
+    }
 }
 
-pub fn col_bool(row: &SqliteRow, i: usize) -> Result<Value, ApiError> {
-    Ok(Value::Bool(row.try_get::<i64, _>(i)? != 0))
+impl From<String> for Arg {
+    fn from(v: String) -> Self {
+        Arg::Text(v)
+    }
+}
+
+impl From<i64> for Arg {
+    fn from(v: i64) -> Self {
+        Arg::Int(v)
+    }
+}
+
+impl From<bool> for Arg {
+    fn from(v: bool) -> Self {
+        Arg::Int(i64::from(v))
+    }
+}
+
+impl From<Option<String>> for Arg {
+    fn from(v: Option<String>) -> Self {
+        v.map_or(Arg::Null, Arg::Text)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Col {
+    Text,
+    Int,
+    Bool,
+}
+
+pub type Cols<'a> = &'a [(&'a str, Col)];
+
+macro_rules! bound {
+    ($sql:expr, $args:expr) => {{
+        let mut q = sqlx::query($sql);
+        for a in $args {
+            q = match a {
+                Arg::Text(s) => q.bind(s.as_str()),
+                Arg::Int(n) => q.bind(*n),
+                Arg::Null => q.bind(None::<&str>),
+            };
+        }
+        q
+    }};
+}
+
+fn decode<R>(row: &R, cols: Cols<'_>) -> Result<Value, sqlx::Error>
+where
+    R: Row,
+    usize: sqlx::ColumnIndex<R>,
+    for<'r> String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    let mut m = Map::with_capacity(cols.len());
+    for (i, (name, col)) in cols.iter().enumerate() {
+        let v = match col {
+            Col::Text => Value::String(row.try_get::<String, _>(i)?),
+            Col::Int => Value::from(row.try_get::<i64, _>(i)?),
+            Col::Bool => Value::Bool(row.try_get::<i64, _>(i)? != 0),
+        };
+        m.insert((*name).to_string(), v);
+    }
+    Ok(Value::Object(m))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Clone)]
+pub enum Pool {
+    Sqlite(SqlitePool),
+    Postgres(PgPool),
+}
+
+pub enum Conn {
+    Sqlite(Transaction<'static, Sqlite>),
+    Postgres(Transaction<'static, Postgres>),
+}
+
+impl Pool {
+    pub fn dialect(&self) -> Dialect {
+        match self {
+            Pool::Sqlite(_) => Dialect::Sqlite,
+            Pool::Postgres(_) => Dialect::Postgres,
+        }
+    }
+
+    pub async fn fetch_all(
+        &self,
+        sql: &str,
+        args: &[Arg],
+        cols: Cols<'_>,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        match self {
+            Pool::Sqlite(p) => bound!(sql, args)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(|r| decode(r, cols))
+                .collect(),
+            Pool::Postgres(p) => bound!(sql, args)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(|r| decode(r, cols))
+                .collect(),
+        }
+    }
+
+    async fn begin(&self) -> Result<Conn, sqlx::Error> {
+        Ok(match self {
+            Pool::Sqlite(p) => Conn::Sqlite(p.begin_with("BEGIN IMMEDIATE").await?),
+            Pool::Postgres(p) => Conn::Postgres(p.begin().await?),
+        })
+    }
+
+    async fn close(&self) {
+        match self {
+            Pool::Sqlite(p) => p.close().await,
+            Pool::Postgres(p) => p.close().await,
+        }
+    }
+}
+
+impl Conn {
+    pub async fn fetch_optional(
+        &mut self,
+        sql: &str,
+        args: &[Arg],
+        cols: Cols<'_>,
+    ) -> Result<Option<Value>, sqlx::Error> {
+        match self {
+            Conn::Sqlite(c) => bound!(sql, args)
+                .fetch_optional(&mut **c)
+                .await?
+                .map(|r| decode(&r, cols))
+                .transpose(),
+            Conn::Postgres(c) => bound!(sql, args)
+                .fetch_optional(&mut **c)
+                .await?
+                .map(|r| decode(&r, cols))
+                .transpose(),
+        }
+    }
+
+    pub async fn fetch_one(
+        &mut self,
+        sql: &str,
+        args: &[Arg],
+        cols: Cols<'_>,
+    ) -> Result<Value, sqlx::Error> {
+        self.fetch_optional(sql, args, cols)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)
+    }
+
+    pub async fn execute(&mut self, sql: &str, args: &[Arg]) -> Result<u64, sqlx::Error> {
+        Ok(match self {
+            Conn::Sqlite(c) => bound!(sql, args).execute(&mut **c).await?.rows_affected(),
+            Conn::Postgres(c) => bound!(sql, args).execute(&mut **c).await?.rows_affected(),
+        })
+    }
+
+    async fn int(&mut self, sql: &str, args: &[Arg]) -> Result<i64, sqlx::Error> {
+        let v = self.fetch_one(sql, args, &[("v", Col::Int)]).await?;
+        Ok(v["v"].as_i64().unwrap_or_default())
+    }
+
+    async fn text(&mut self, sql: &str, args: &[Arg]) -> Result<Option<String>, sqlx::Error> {
+        let v = self.fetch_optional(sql, args, &[("v", Col::Text)]).await?;
+        Ok(v.and_then(|v| v["v"].as_str().map(str::to_string)))
+    }
+
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        match self {
+            Conn::Sqlite(c) => c.commit().await,
+            Conn::Postgres(c) => c.commit().await,
+        }
+    }
+
+    async fn rollback(self) -> Result<(), sqlx::Error> {
+        match self {
+            Conn::Sqlite(c) => c.rollback().await,
+            Conn::Postgres(c) => c.rollback().await,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -335,7 +524,7 @@ enum FaultPoint {
 
 struct Shared {
     spec: &'static AppSpec,
-    db: SqlitePool,
+    db: Pool,
     auth: Mutex<Auth>,
     rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     permits: Arc<Semaphore>,
@@ -497,13 +686,13 @@ pub enum Begin {
 }
 
 pub struct Tx {
-    tx: Transaction<'static, Sqlite>,
+    tx: Conn,
     hash: String,
-    _writer: OwnedMutexGuard<()>,
+    _writer: Option<OwnedMutexGuard<()>>,
 }
 
 impl Tx {
-    pub fn conn(&mut self) -> &mut SqliteConnection {
+    pub fn conn(&mut self) -> &mut Conn {
         &mut self.tx
     }
 }
@@ -513,7 +702,7 @@ impl Ctx {
         self.actor
     }
 
-    pub fn db(&self) -> &SqlitePool {
+    pub fn db(&self) -> &Pool {
         &self.shared.db
     }
 
@@ -529,18 +718,29 @@ impl Ctx {
 
     pub async fn begin_mutation(&self, input_hash: String) -> Result<Begin, ApiError> {
         let key = self.key.as_deref().unwrap_or_default();
-        let writer = self.shared.writer.clone().lock_owned().await;
-        let mut tx = self.shared.db.begin_with("BEGIN IMMEDIATE").await?;
-        let found: Option<(String, String)> = sqlx::query_as(
-            "SELECT \"input_sha256\", \"response\" FROM \"_nari_receipts\" WHERE \"actor\" = ?1 AND \"action\" = ?2 AND \"key\" = ?3",
-        )
-        .bind(self.actor)
-        .bind(self.action)
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some((hash, response)) = found {
+        let writer = match self.shared.db {
+            Pool::Sqlite(_) => Some(self.shared.writer.clone().lock_owned().await),
+            Pool::Postgres(_) => None,
+        };
+        let mut tx = self.shared.db.begin().await?;
+        if let Conn::Postgres(_) = tx {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[Arg::Text(json!([self.actor, self.action, key]).to_string())],
+            )
+            .await?;
+        }
+        let found = tx
+            .fetch_optional(
+                "SELECT \"input_sha256\", \"response\" FROM \"_nari_receipts\" WHERE \"actor\" = $1 AND \"action\" = $2 AND \"key\" = $3",
+                &[self.actor.into(), self.action.into(), key.into()],
+                &[("hash", Col::Text), ("response", Col::Text)],
+            )
+            .await?;
+        if let Some(found) = found {
             tx.rollback().await?;
+            let hash = found["hash"].as_str().unwrap_or_default();
+            let response = found["response"].as_str().unwrap_or_default();
             if hash != input_hash {
                 return Err(ApiError::new(
                     409,
@@ -548,7 +748,7 @@ impl Ctx {
                     "this Idempotency-Key was already used with different input",
                 ));
             }
-            let data = serde_json::from_str(&response)
+            let data = serde_json::from_str(response)
                 .map_err(|_| ApiError::new(500, "INTERNAL", "internal error"))?;
             return Ok(Begin::Replay(data));
         }
@@ -561,17 +761,19 @@ impl Ctx {
 
     pub async fn commit_mutation(&self, mut tx: Tx, data: Value) -> Result<Value, ApiError> {
         let key = self.key.as_deref().unwrap_or_default();
-        sqlx::query(
-            "INSERT INTO \"_nari_receipts\" (\"actor\", \"action\", \"key\", \"input_sha256\", \"response\", \"created_ms\") VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(self.actor)
-        .bind(self.action)
-        .bind(key)
-        .bind(tx.hash.clone())
-        .bind(data.to_string())
-        .bind(now_ms())
-        .execute(&mut *tx.tx)
-        .await?;
+        tx.tx
+            .execute(
+                "INSERT INTO \"_nari_receipts\" (\"actor\", \"action\", \"key\", \"input_sha256\", \"response\", \"created_ms\") VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    self.actor.into(),
+                    self.action.into(),
+                    key.into(),
+                    tx.hash.clone().into(),
+                    data.to_string().into(),
+                    now_ms().into(),
+                ],
+            )
+            .await?;
         self.fault(FaultPoint::BeforeCommit);
         tx.tx.commit().await?;
         self.fault(FaultPoint::AfterCommit);
@@ -585,11 +787,15 @@ impl Ctx {
         id: &str,
         expected: i64,
     ) -> ApiError {
-        let current: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(exists_sql)
-            .bind(id)
-            .bind(self.actor)
-            .fetch_optional(tx.conn())
-            .await;
+        let current = tx
+            .tx
+            .fetch_optional(
+                exists_sql,
+                &[id.into(), self.actor.into()],
+                &[("revision", Col::Int)],
+            )
+            .await
+            .map(|row| row.and_then(|r| r["revision"].as_i64()));
         let _ = tx.tx.rollback().await;
         match current {
             Err(e) => e.into(),
@@ -1103,9 +1309,14 @@ async fn static_route(
     ))
 }
 
+pub enum DbTarget {
+    Sqlite(PathBuf),
+    Postgres(String),
+}
+
 pub struct Config {
     pub mutations_per_minute: usize,
-    pub database: PathBuf,
+    pub database: DbTarget,
     pub port: u16,
     pub owner_token: Option<String>,
     pub supervised: bool,
@@ -1114,13 +1325,28 @@ pub struct Config {
 
 impl Config {
     pub fn from_env(spec: &AppSpec) -> Result<Config, String> {
-        let database = std::env::var("NARI_DATABASE").unwrap_or_else(|_| spec.database.to_string());
+        let database = match std::env::var("NARI_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        {
+            Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
+                DbTarget::Postgres(url)
+            }
+            Some(_) => {
+                return Err(
+                    "NARI_DATABASE_URL must be a postgres:// or postgresql:// URL".to_string(),
+                );
+            }
+            None => DbTarget::Sqlite(PathBuf::from(
+                std::env::var("NARI_DATABASE").unwrap_or_else(|_| spec.database.to_string()),
+            )),
+        };
         let port = match std::env::var("NARI_PORT") {
             Ok(p) => p.parse().map_err(|_| format!("invalid NARI_PORT '{p}'"))?,
             Err(_) => spec.port,
         };
         Ok(Config {
-            database: PathBuf::from(database),
+            database,
             port,
             owner_token: std::env::var("NARI_OWNER_TOKEN")
                 .ok()
@@ -1174,7 +1400,6 @@ fn check_db_path(path: &std::path::Path) -> Result<(), String> {
 pub struct EntityShape {
     pub name: String,
     pub owner: String,
-    pub create: Vec<String>,
     pub fields: Vec<FieldShape>,
 }
 
@@ -1183,13 +1408,93 @@ pub struct FieldShape {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: Value,
-    pub add: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MigrationStep {
     pub summary: String,
     pub sql: Vec<String>,
+}
+
+pub fn quote(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+pub fn table(entity: &str) -> String {
+    quote(&format!("entity_{entity}"))
+}
+
+fn int_type(d: Dialect) -> &'static str {
+    match d {
+        Dialect::Sqlite => "INTEGER",
+        Dialect::Postgres => "BIGINT",
+    }
+}
+
+fn strict(d: Dialect) -> &'static str {
+    match d {
+        Dialect::Sqlite => " STRICT",
+        Dialect::Postgres => "",
+    }
+}
+
+fn column_def(f: &FieldShape, d: Dialect) -> String {
+    let name = quote(&f.name);
+    match f.ty["name"].as_str() {
+        Some("Bool") => format!("{name} {} NOT NULL CHECK ({name} IN (0, 1))", int_type(d)),
+        Some("Int") => format!("{name} {} NOT NULL", int_type(d)),
+        _ => format!("{name} TEXT NOT NULL"),
+    }
+}
+
+fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Bool(b) => i32::from(*b).to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn entity_ddl(e: &EntityShape, d: Dialect) -> Vec<String> {
+    let id = match d {
+        Dialect::Sqlite => "\"id\" TEXT PRIMARY KEY NOT NULL",
+        Dialect::Postgres => "\"id\" TEXT COLLATE \"C\" PRIMARY KEY NOT NULL",
+    };
+    let mut cols = vec![
+        id.to_string(),
+        format!(
+            "\"revision\" {} NOT NULL CHECK (\"revision\" >= 1)",
+            int_type(d)
+        ),
+    ];
+    cols.extend(e.fields.iter().map(|f| column_def(f, d)));
+    vec![
+        format!(
+            "CREATE TABLE {} ({}){}",
+            table(&e.name),
+            cols.join(", "),
+            strict(d)
+        ),
+        format!(
+            "CREATE INDEX {} ON {} ({}, \"id\")",
+            quote(&format!("entity_{}_owner", e.name)),
+            table(&e.name),
+            quote(&e.owner)
+        ),
+    ]
+}
+
+fn add_column(e: &EntityShape, f: &FieldShape, d: Dialect) -> Option<String> {
+    f.default.as_ref().map(|v| {
+        format!(
+            "ALTER TABLE {} ADD COLUMN {} DEFAULT {}",
+            table(&e.name),
+            column_def(f, d),
+            sql_literal(v)
+        )
+    })
 }
 
 fn type_label(t: &Value) -> String {
@@ -1215,6 +1520,7 @@ fn widens(old: &Value, new: &Value) -> bool {
 pub fn migration_plan(
     old: &[EntityShape],
     new: &[EntityShape],
+    d: Dialect,
 ) -> Result<Vec<MigrationStep>, Vec<String>> {
     let mut steps = Vec::new();
     let mut blocked = Vec::new();
@@ -1228,7 +1534,7 @@ pub fn migration_plan(
         let Some(o) = old.iter().find(|o| o.name == n.name) else {
             steps.push(MigrationStep {
                 summary: format!("create entity {}", n.name),
-                sql: n.create.clone(),
+                sql: entity_ddl(n, d),
             });
             continue;
         };
@@ -1250,10 +1556,10 @@ pub fn migration_plan(
         }
         for nf in &n.fields {
             let path = format!("{}.{}", n.name, nf.name);
-            match (o.fields.iter().find(|f| f.name == nf.name), &nf.add) {
+            match (o.fields.iter().find(|f| f.name == nf.name), add_column(n, nf, d)) {
                 (None, Some(sql)) => steps.push(MigrationStep {
                     summary: format!("add field {path}"),
-                    sql: vec![sql.clone()],
+                    sql: vec![sql],
                 }),
                 (None, None) => blocked.push(format!(
                     "field {path} was added without a default, so existing rows have no value for it"
@@ -1294,86 +1600,119 @@ impl From<sqlx::Error> for OpenError {
     }
 }
 
-pub async fn open_database(
-    spec: &AppSpec,
-    path: &std::path::Path,
-) -> Result<SqlitePool, OpenError> {
-    check_db_path(path).map_err(OpenError::Config)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| OpenError::Config(format!("cannot create {}: {e}", parent.display())))?;
-        check_db_path(path).map_err(OpenError::Config)?;
-    }
-    let existed = path.exists();
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5))
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
-        .await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    let has_meta: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_nari_meta'",
-    )
-    .fetch_optional(&pool)
-    .await?;
-    if has_meta.is_none() {
-        let tables: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'")
-                .fetch_one(&pool)
+async fn connect(target: &DbTarget) -> Result<(Pool, bool), OpenError> {
+    match target {
+        DbTarget::Postgres(url) => {
+            let pool = PgPoolOptions::new()
+                .max_connections(8)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(url)
                 .await?;
-        if existed && tables > 0 {
+            Ok((Pool::Postgres(pool), true))
+        }
+        DbTarget::Sqlite(path) => {
+            check_db_path(path).map_err(OpenError::Config)?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    OpenError::Config(format!("cannot create {}: {e}", parent.display()))
+                })?;
+                check_db_path(path).map_err(OpenError::Config)?;
+            }
+            let existed = path.exists();
+            let opts = SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(5))
+                .foreign_keys(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(8)
+                .connect_with(opts)
+                .await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok((Pool::Sqlite(pool), existed))
+        }
+    }
+}
+
+const STARTUP_LOCK: i64 = 0x6e61_7269_5f6d_6967;
+
+pub async fn open_database(spec: &AppSpec, target: &DbTarget) -> Result<Pool, OpenError> {
+    let shapes: Vec<EntityShape> = serde_json::from_str(spec.schema_shape)
+        .map_err(|e| OpenError::Config(format!("compiled schema shape is invalid: {e}")))?;
+    let (pool, existed) = connect(target).await?;
+    let d = pool.dialect();
+    let tables_sql = match d {
+        Dialect::Sqlite => "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+        Dialect::Postgres => {
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema()"
+        }
+    };
+    let mut tx = pool.begin().await?;
+    if d == Dialect::Postgres {
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[STARTUP_LOCK.into()])
+            .await?;
+    }
+    let has_meta = tx
+        .int(
+            &format!(
+                "{tables_sql} AND {} = '_nari_meta'",
+                match d {
+                    Dialect::Sqlite => "name",
+                    Dialect::Postgres => "table_name",
+                }
+            ),
+            &[],
+        )
+        .await?
+        > 0;
+    if !has_meta {
+        if existed && tx.int(tables_sql, &[]).await? > 0 {
             return Err(OpenError::MigrationRequired(
                 "database contains tables but no Imanari schema fingerprint".into(),
             ));
         }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("CREATE TABLE \"_nari_meta\" (\"key\" TEXT PRIMARY KEY NOT NULL, \"value\" TEXT NOT NULL) STRICT")
-            .execute(&mut *tx)
+        let int = int_type(d);
+        let strict = strict(d);
+        tx.execute(&format!("CREATE TABLE \"_nari_meta\" (\"key\" TEXT PRIMARY KEY NOT NULL, \"value\" TEXT NOT NULL){strict}"), &[])
             .await?;
-        sqlx::query("CREATE TABLE \"_nari_receipts\" (\"actor\" TEXT NOT NULL, \"action\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"input_sha256\" TEXT NOT NULL, \"response\" TEXT NOT NULL, \"created_ms\" INTEGER NOT NULL, PRIMARY KEY (\"actor\", \"action\", \"key\")) STRICT")
-            .execute(&mut *tx)
+        tx.execute(&format!("CREATE TABLE \"_nari_receipts\" (\"actor\" TEXT NOT NULL, \"action\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"input_sha256\" TEXT NOT NULL, \"response\" TEXT NOT NULL, \"created_ms\" {int} NOT NULL, PRIMARY KEY (\"actor\", \"action\", \"key\")){strict}"), &[])
             .await?;
-        for stmt in spec.schema {
-            sqlx::query(stmt).execute(&mut *tx).await?;
+        for stmt in shapes.iter().flat_map(|e| entity_ddl(e, d)) {
+            tx.execute(&stmt, &[]).await?;
         }
-        sqlx::query("INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_fingerprint', ?1), ('app', ?2), ('schema_shape', ?3)")
-            .bind(spec.schema_fingerprint)
-            .bind(spec.name)
-            .bind(spec.schema_shape)
-            .execute(&mut *tx)
-            .await?;
+        tx.execute(
+            "INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_fingerprint', $1), ('app', $2), ('schema_shape', $3)",
+            &[
+                spec.schema_fingerprint.into(),
+                spec.name.into(),
+                spec.schema_shape.into(),
+            ],
+        )
+        .await?;
         tx.commit().await?;
         return Ok(pool);
     }
-    let meta = |key: &'static str| {
-        sqlx::query_scalar::<_, String>("SELECT \"value\" FROM \"_nari_meta\" WHERE \"key\" = ?1")
-            .bind(key)
-            .fetch_optional(&pool)
-    };
-    let Some(stored) = meta("schema_fingerprint").await? else {
+    let meta_sql = "SELECT \"value\" FROM \"_nari_meta\" WHERE \"key\" = $1";
+    let Some(stored) = tx.text(meta_sql, &["schema_fingerprint".into()]).await? else {
         return Err(OpenError::MigrationRequired(
             "schema fingerprint missing".into(),
         ));
     };
-    let stored_shape = meta("schema_shape").await?;
+    let stored_shape = tx.text(meta_sql, &["schema_shape".into()]).await?;
     if stored == spec.schema_fingerprint {
         if stored_shape.is_none() {
-            sqlx::query(
-                "INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_shape', ?1)",
+            tx.execute(
+                "INSERT INTO \"_nari_meta\" (\"key\", \"value\") VALUES ('schema_shape', $1)",
+                &[spec.schema_shape.into()],
             )
-            .bind(spec.schema_shape)
-            .execute(&pool)
             .await?;
         }
+        tx.commit().await?;
         return Ok(pool);
     }
     let Some(old) = stored_shape else {
@@ -1385,41 +1724,44 @@ pub async fn open_database(
     let old: Vec<EntityShape> = serde_json::from_str(&old).map_err(|e| {
         OpenError::MigrationRequired(format!("stored schema shape is unreadable: {e}"))
     })?;
-    let new: Vec<EntityShape> = serde_json::from_str(spec.schema_shape)
-        .map_err(|e| OpenError::Config(format!("compiled schema shape is invalid: {e}")))?;
-    let steps = migration_plan(&old, &new)
+    let steps = migration_plan(&old, &shapes, d)
         .map_err(|blocked| OpenError::MigrationRequired(blocked.join("; ")))?;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let claimed = sqlx::query(
-        "UPDATE \"_nari_meta\" SET \"value\" = ?1 WHERE \"key\" = 'schema_fingerprint' AND \"value\" = ?2",
-    )
-    .bind(spec.schema_fingerprint)
-    .bind(&stored)
-    .execute(&mut *tx)
-    .await?;
-    if claimed.rows_affected() != 1 {
+    let claimed = tx
+        .execute(
+            "UPDATE \"_nari_meta\" SET \"value\" = $1 WHERE \"key\" = 'schema_fingerprint' AND \"value\" = $2",
+            &[spec.schema_fingerprint.into(), stored.as_str().into()],
+        )
+        .await?;
+    if claimed != 1 {
         return Err(OpenError::MigrationRequired(
             "schema fingerprint changed while migrating".into(),
         ));
     }
     for sql in steps.iter().flat_map(|s| &s.sql) {
-        sqlx::query(sql).execute(&mut *tx).await?;
+        tx.execute(sql, &[]).await?;
     }
-    sqlx::query("UPDATE \"_nari_meta\" SET \"value\" = ?1 WHERE \"key\" = 'schema_shape'")
-        .bind(spec.schema_shape)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS \"_nari_schema_history\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"from_fingerprint\" TEXT NOT NULL, \"to_fingerprint\" TEXT NOT NULL, \"steps\" TEXT NOT NULL, \"applied_ms\" INTEGER NOT NULL) STRICT")
-        .execute(&mut *tx)
+    tx.execute(
+        "UPDATE \"_nari_meta\" SET \"value\" = $1 WHERE \"key\" = 'schema_shape'",
+        &[spec.schema_shape.into()],
+    )
+    .await?;
+    let history_id = match d {
+        Dialect::Sqlite => "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT",
+        Dialect::Postgres => "\"id\" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+    };
+    tx.execute(&format!("CREATE TABLE IF NOT EXISTS \"_nari_schema_history\" ({history_id}, \"from_fingerprint\" TEXT NOT NULL, \"to_fingerprint\" TEXT NOT NULL, \"steps\" TEXT NOT NULL, \"applied_ms\" {} NOT NULL){}", int_type(d), strict(d)), &[])
         .await?;
     let summaries: Vec<&str> = steps.iter().map(|s| s.summary.as_str()).collect();
-    sqlx::query("INSERT INTO \"_nari_schema_history\" (\"from_fingerprint\", \"to_fingerprint\", \"steps\", \"applied_ms\") VALUES (?1, ?2, ?3, ?4)")
-        .bind(&stored)
-        .bind(spec.schema_fingerprint)
-        .bind(json!(summaries).to_string())
-        .bind(now_ms())
-        .execute(&mut *tx)
-        .await?;
+    tx.execute(
+        "INSERT INTO \"_nari_schema_history\" (\"from_fingerprint\", \"to_fingerprint\", \"steps\", \"applied_ms\") VALUES ($1, $2, $3, $4)",
+        &[
+            stored.as_str().into(),
+            spec.schema_fingerprint.into(),
+            json!(summaries).to_string().into(),
+            now_ms().into(),
+        ],
+    )
+    .await?;
     tx.commit().await?;
     if summaries.is_empty() {
         log("schema fingerprint updated; no table changes were needed");

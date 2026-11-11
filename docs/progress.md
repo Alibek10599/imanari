@@ -95,6 +95,7 @@ The generated Rust calls the same `imanari-runtime` validators the handlers use.
 
 - **Isolation off macOS.** Repair isolation uses macOS Seatbelt. Elsewhere, `nari repair` runs proposal and static validation and reports `SANDBOX_UNAVAILABLE` (tested with `NARI_SANDBOX=none`), so the dynamic gate stays open on those platforms. A Linux backend (namespaces, seccomp or a container) is the missing prerequisite.
 - **Unenforced macOS limits.** Memory and process-count rlimits are not enforced by macOS in the sandbox. Wall-clock, CPU, file-size and open-file limits are, and the run phase denies `fork`.
+- **PostgreSQL without TLS.** `NARI_DATABASE_URL` runs apps on PostgreSQL ([D18](decisions.md)), but TLS is not compiled in, so managed databases that require it are refused at startup.
 - **Telemetry is local only.** Per-action counters and latency histograms sit behind a bounded queue with a dropped-event counter ([D17](decisions.md)) and are read through `nari status` or the owner-only `/_nari/metrics`. They are not exported or persisted across restarts. Incidents and recovery transitions are still persisted before any action.
 - **Incident links.** Incident `supersedes`/`revoked_by` fields exist but nothing sets them yet. No CLI exists to link decision records to nodes.
 - **File permissions.** SQLite WAL and SHM side files are created with the process umask. Only the main app and control database files are set to `0600`.
@@ -105,7 +106,7 @@ The generated Rust calls the same `imanari-runtime` validators the handlers use.
 
 Locked in `Cargo.lock` and pinned by `rust-toolchain.toml` (1.97.1).
 
-- **Direct dependencies:** clap 4, serde and serde_json 1, sha2 0.10, getrandom 0.3, tokio 1.53, sqlx 0.8.6 (SQLite, bundled libsqlite3), rlimit 0.11 (CLI only), and axum 0.8.9 (runtime only).
+- **Direct dependencies:** clap 4, serde and serde_json 1, sha2 0.10, getrandom 0.3, tokio 1.53, sqlx 0.8.6 (SQLite with bundled libsqlite3, and PostgreSQL without TLS), rlimit 0.11 (CLI only), and axum 0.8.9 (runtime only).
 - **Unsafe code:** all first-party crates and generated code use `#![forbid(unsafe_code)]`. Dependencies, SQLite and the OS are trusted components and still contain unsafe code.
 - **Untrusted inputs:** Imanari source, HTTP input, repair proposals, and incident and telemetry text. Proposals are parsed as data, path-checked, applied to a snapshot, fully rechecked, and then built and run only inside the sandbox with a cleared environment.
 - **No shells:** builds and runs pass executable and argument arrays.
