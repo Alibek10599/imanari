@@ -262,6 +262,7 @@ pub fn diff(base: &Compiled, cur: &Compiled) -> Json {
     let (automatic, blocked) = match imanari_runtime::migration_plan(
         &codegen::schema_shape(&base.app),
         &codegen::schema_shape(&cur.app),
+        imanari_runtime::Dialect::Sqlite,
     ) {
         Ok(steps) => (steps.into_iter().map(|s| s.summary).collect(), Vec::new()),
         Err(blocked) => (Vec::new(), blocked),

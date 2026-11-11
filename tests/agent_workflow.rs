@@ -389,16 +389,17 @@ fn schema_changes_are_planned_as_automatic_or_blocked() {
     new[0].fields.push(imanari_runtime::FieldShape {
         name: "due".into(),
         ty: json!({ "name": "Int" }),
-        add: None,
+        default: None,
     });
-    let blocked = imanari_runtime::migration_plan(&old, &new).unwrap_err();
+    let sqlite = imanari_runtime::Dialect::Sqlite;
+    let blocked = imanari_runtime::migration_plan(&old, &new, sqlite).unwrap_err();
     assert!(
         blocked[0].contains("Task.due was added without a default"),
         "{blocked:?}"
     );
     new[0].owner = "title".into();
     assert_eq!(
-        imanari_runtime::migration_plan(&old, &new)
+        imanari_runtime::migration_plan(&old, &new, sqlite)
             .unwrap_err()
             .len(),
         2
@@ -408,10 +409,10 @@ fn schema_changes_are_planned_as_automatic_or_blocked() {
         name: "Note".into(),
         ..old[0].clone()
     });
-    let steps = imanari_runtime::migration_plan(&old, &extra).unwrap();
+    let steps = imanari_runtime::migration_plan(&old, &extra, sqlite).unwrap();
     assert_eq!(steps[0].summary, "create entity Note");
     assert!(
-        imanari_runtime::migration_plan(&extra, &old).unwrap_err()[0]
+        imanari_runtime::migration_plan(&extra, &old, sqlite).unwrap_err()[0]
             .contains("entity Note was removed")
     );
 }

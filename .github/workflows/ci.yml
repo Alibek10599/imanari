@@ -34,8 +34,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       NARI_REQUIRE_BROWSER: 1
+      NARI_REQUIRE_POSTGRES: 1
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
+      - if: runner.os == 'macOS'
+        run: ls /opt/homebrew/opt/postgresql@*/bin/initdb || brew install postgresql@16
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace

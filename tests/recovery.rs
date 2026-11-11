@@ -21,6 +21,7 @@ impl Dev {
             .args(args)
             .env("NARI_TARGET_DIR", SHARED_TARGET)
             .env_remove("NARI_FAULT")
+            .env_remove("NARI_DATABASE_URL")
             .env_remove("NARI_PORT")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
