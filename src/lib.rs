@@ -5,6 +5,7 @@ pub mod artifacts;
 pub mod bench;
 pub mod codegen;
 pub mod context;
+pub mod deploy;
 pub mod diag;
 pub mod diff;
 pub mod fmt;

@@ -35,6 +35,7 @@ jobs:
     env:
       NARI_REQUIRE_BROWSER: 1
       NARI_REQUIRE_POSTGRES: 1
+      NARI_REQUIRE_DOCKER: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install

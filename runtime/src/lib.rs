@@ -1317,6 +1317,7 @@ pub enum DbTarget {
 pub struct Config {
     pub mutations_per_minute: usize,
     pub database: DbTarget,
+    pub bind: std::net::IpAddr,
     pub port: u16,
     pub owner_token: Option<String>,
     pub supervised: bool,
@@ -1345,8 +1346,13 @@ impl Config {
             Ok(p) => p.parse().map_err(|_| format!("invalid NARI_PORT '{p}'"))?,
             Err(_) => spec.port,
         };
+        let bind = match std::env::var("NARI_BIND") {
+            Ok(b) => b.parse().map_err(|_| format!("invalid NARI_BIND '{b}'"))?,
+            Err(_) => std::net::IpAddr::from([127, 0, 0, 1]),
+        };
         Ok(Config {
             database,
+            bind,
             port,
             owner_token: std::env::var("NARI_OWNER_TOKEN")
                 .ok()
@@ -1823,10 +1829,10 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
+    let listener = match tokio::net::TcpListener::bind((cfg.bind, cfg.port)).await {
         Ok(l) => l,
         Err(e) => {
-            log(&format!("cannot bind 127.0.0.1:{}: {e}", cfg.port));
+            log(&format!("cannot bind {}:{}: {e}", cfg.bind, cfg.port));
             return ExitCode::FAILURE;
         }
     };
