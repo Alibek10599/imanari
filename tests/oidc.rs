@@ -86,25 +86,32 @@ fn form(s: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn key(dir: &Path, name: &str) -> RsaKeyPair {
-    let path = dir.join(format!("{name}.der"));
-    let out = Command::new("openssl")
-        .args([
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-        ])
-        .args(["-outform", "DER", "-out", path.to_str().unwrap()])
-        .output()
-        .unwrap();
+fn openssl(args: &[&str]) {
+    let out = Command::new("openssl").args(args).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    RsaKeyPair::from_pkcs8(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn key(dir: &Path, name: &str) -> RsaKeyPair {
+    let pem = dir.join(format!("{name}.pem"));
+    let der = dir.join(format!("{name}.der"));
+    let (pem, der) = (pem.to_str().unwrap(), der.to_str().unwrap());
+    openssl(&[
+        "genpkey",
+        "-algorithm",
+        "RSA",
+        "-pkeyopt",
+        "rsa_keygen_bits:2048",
+        "-out",
+        pem,
+    ]);
+    openssl(&[
+        "pkcs8", "-topk8", "-nocrypt", "-in", pem, "-outform", "DER", "-out", der,
+    ]);
+    RsaKeyPair::from_pkcs8(&std::fs::read(der).unwrap()).unwrap()
 }
 
 impl Idp {
