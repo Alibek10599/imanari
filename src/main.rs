@@ -89,10 +89,7 @@ enum Command {
     Plan {
         #[arg(long, help = "Container name (default nari-<app>)")]
         name: Option<String>,
-        #[arg(
-            long,
-            help = "Host loopback port to publish (default: the declared port)"
-        )]
+        #[arg(long, help = "Port to publish (default: the declared port)")]
         port: Option<u16>,
         #[arg(
             long,
@@ -102,9 +99,22 @@ enum Command {
         database_url_env: Option<String>,
         #[arg(
             long,
-            help = "Plan a production environment (needs a production identity adapter)"
+            help = "Plan a production environment (needs identity mode oidc)"
         )]
         production: bool,
+        #[arg(
+            long,
+            help = "URL browsers use to reach the app (oidc apps; https in production)"
+        )]
+        public_url: Option<String>,
+        #[arg(
+            long,
+            value_name = "VAR",
+            help = "Environment variable holding the OIDC client secret, read at release"
+        )]
+        oidc_secret_env: Option<String>,
+        #[arg(long, help = "Host address to publish on (default 127.0.0.1)")]
+        publish_address: Option<std::net::IpAddr>,
     },
     #[command(about = "Apply a reviewed deployment plan, identified by its hash")]
     Release { plan: String },
@@ -238,6 +248,9 @@ fn run(cli: Cli, json: bool) -> CmdResult {
             port,
             database_url_env,
             production,
+            public_url,
+            oidc_secret_env,
+            publish_address,
         } => plan(
             &project(cli.project)?,
             &imanari::deploy::PlanOptions {
@@ -245,6 +258,9 @@ fn run(cli: Cli, json: bool) -> CmdResult {
                 port,
                 database_url_env,
                 production,
+                public_url,
+                oidc_secret_env,
+                publish_address,
             },
         ),
         Command::Release { plan } => release(&project(cli.project)?, &plan),

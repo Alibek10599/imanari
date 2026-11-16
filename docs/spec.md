@@ -103,7 +103,7 @@ Generate loading, empty, error, and success states; prevent double submission wh
 
 ### 5.4 Runtime and policy declarations
 
-`identity NAME { mode = local_dev; }` is the only 0.1 identity mode. `runtime` properties are `bind` (must be 127.0.0.1), `port` (1024..65535), `database` (relative path under `.nari/`), `request_limit_bytes` (1..65536), and `request_timeout_ms` (100..30000). Reject symlink or traversal escapes for generated files and database paths. Persistent files use restrictive permissions where supported.
+`identity NAME { mode = local_dev; }` is the 0.1 identity mode. The production-web release adds `mode = oidc` with `issuer` and `client_id` ([D20](decisions.md)). `runtime` properties are `bind` (must be 127.0.0.1), `port` (1024..65535), `database` (relative path under `.nari/`), `request_limit_bytes` (1..65536), and `request_timeout_ms` (100..30000). Reject symlink or traversal escapes for generated files and database paths. Persistent files use restrictive permissions where supported.
 
 `recovery` declares `target = backend`, `max_restarts`, `window_seconds`, `backoff_ms`, and `after_exhaustion = stop`. Bounds: restarts 0..10, window 1..3600 seconds, backoffs 0..60000 ms. Array length must equal max_restarts. Restart budgets are persisted and cannot reset merely by restarting the supervisor.
 

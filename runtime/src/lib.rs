@@ -34,6 +34,8 @@ const BOOTSTRAP_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT: usize = 100;
 const MUTATIONS_PER_MINUTE: usize = 60;
 const MAX_MUTATIONS_PER_MINUTE: usize = 1_000_000;
+#[cfg(feature = "oidc")]
+const MAX_SESSIONS: usize = 100_000;
 const TELEMETRY_CAPACITY: usize = 1024;
 const TELEMETRY_BATCH: usize = 256;
 const LATENCY_BOUNDS_US: [u64; 17] = [
@@ -61,8 +63,17 @@ pub struct Asset {
     pub body: &'static str,
 }
 
+pub enum Identity {
+    LocalDev,
+    Oidc {
+        issuer: &'static str,
+        client_id: &'static str,
+    },
+}
+
 pub struct AppSpec {
     pub name: &'static str,
+    pub identity: Identity,
     pub source_sha256: &'static str,
     pub semantic_sha256: &'static str,
     pub schema_fingerprint: &'static str,
@@ -538,6 +549,9 @@ struct Shared {
     mutations_per_minute: usize,
     shutdown: watch::Sender<bool>,
     telemetry: Telemetry,
+    secure_cookies: bool,
+    #[cfg(feature = "oidc")]
+    oidc: Option<oidc::Oidc>,
 }
 
 struct Event {
@@ -660,7 +674,7 @@ async fn drain_telemetry(
 }
 
 struct Session {
-    actor: Option<(&'static str, &'static str)>,
+    actor: Option<(String, String)>,
     csrf: String,
     controller: bool,
     expires: Instant,
@@ -675,7 +689,7 @@ struct Auth {
 #[derive(Clone)]
 pub struct Ctx {
     shared: Arc<Shared>,
-    actor: &'static str,
+    actor: String,
     action: &'static str,
     key: Option<String>,
 }
@@ -698,8 +712,8 @@ impl Tx {
 }
 
 impl Ctx {
-    pub fn actor(&self) -> &'static str {
-        self.actor
+    pub fn actor(&self) -> &str {
+        &self.actor
     }
 
     pub fn db(&self) -> &Pool {
@@ -733,7 +747,7 @@ impl Ctx {
         let found = tx
             .fetch_optional(
                 "SELECT \"input_sha256\", \"response\" FROM \"_nari_receipts\" WHERE \"actor\" = $1 AND \"action\" = $2 AND \"key\" = $3",
-                &[self.actor.into(), self.action.into(), key.into()],
+                &[self.actor().into(), self.action.into(), key.into()],
                 &[("hash", Col::Text), ("response", Col::Text)],
             )
             .await?;
@@ -765,7 +779,7 @@ impl Ctx {
             .execute(
                 "INSERT INTO \"_nari_receipts\" (\"actor\", \"action\", \"key\", \"input_sha256\", \"response\", \"created_ms\") VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
-                    self.actor.into(),
+                    self.actor().into(),
                     self.action.into(),
                     key.into(),
                     tx.hash.clone().into(),
@@ -791,7 +805,7 @@ impl Ctx {
             .tx
             .fetch_optional(
                 exists_sql,
-                &[id.into(), self.actor.into()],
+                &[id.into(), self.actor().into()],
                 &[("revision", Col::Int)],
             )
             .await
@@ -876,12 +890,19 @@ fn cookie<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-fn session_cookie(name: &str, token: &str) -> HeaderValue {
-    HeaderValue::from_str(&format!(
-        "{name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        SESSION_TTL.as_secs()
-    ))
-    .expect("hex token forms a valid header")
+fn cookie_header(name: &str, value: &str, attrs: &str, secure: bool) -> HeaderValue {
+    let secure = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!("{name}={value}; HttpOnly; {attrs}{secure}"))
+        .expect("hex token forms a valid header")
+}
+
+fn session_cookie(name: &str, token: &str, secure: bool) -> HeaderValue {
+    cookie_header(
+        name,
+        token,
+        &format!("SameSite=Strict; Path=/; Max-Age={}", SESSION_TTL.as_secs()),
+        secure,
+    )
 }
 
 impl Shared {
@@ -930,18 +951,12 @@ impl Shared {
         auth.sessions.get(token)
     }
 
-    fn actor(&self, h: &HeaderMap) -> Result<&'static str, ApiError> {
+    fn actor(&self, h: &HeaderMap) -> Result<String, ApiError> {
         let mut auth = self.auth.lock().expect("auth lock");
         let s = self
             .session(&mut auth, h, "nari_session")
             .filter(|s| !s.controller)
-            .ok_or_else(|| {
-                ApiError::new(
-                    401,
-                    "UNAUTHENTICATED",
-                    "sign in through the local development bootstrap",
-                )
-            })?;
+            .ok_or_else(|| ApiError::new(401, "UNAUTHENTICATED", "sign in first"))?;
         let csrf = header_str(h, "x-nari-csrf").unwrap_or_default();
         if !same(csrf, &s.csrf) {
             return Err(ApiError::new(
@@ -951,7 +966,8 @@ impl Shared {
             ));
         }
         s.actor
-            .map(|(_, id)| id)
+            .as_ref()
+            .map(|(_, id)| id.clone())
             .ok_or_else(|| ApiError::new(401, "UNAUTHENTICATED", "session has no actor"))
     }
 
@@ -1074,7 +1090,7 @@ async fn handle_action(
                 "mutations require an Idempotency-Key header of 1..128 visible ASCII characters",
             ));
         }
-        if app.rate_limited(actor) {
+        if app.rate_limited(&actor) {
             return Err(ApiError::new(
                 429,
                 "RATE_LIMITED",
@@ -1138,10 +1154,14 @@ async fn bootstrap_route(
         );
         let user = auth.user_tokens[0].clone();
         let mut resp = json_response(200, json!({ "data": { "ok": true }, "request_id": rid }));
-        resp.headers_mut()
-            .append(header::SET_COOKIE, session_cookie("nari_dev", &controller));
-        resp.headers_mut()
-            .append(header::SET_COOKIE, session_cookie("nari_session", &user));
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            session_cookie("nari_dev", &controller, app.secure_cookies),
+        );
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            session_cookie("nari_session", &user, app.secure_cookies),
+        );
         Ok(resp)
     }
     .await;
@@ -1184,8 +1204,10 @@ async fn select_route(State(app): State<Arc<Shared>>, headers: HeaderMap, body: 
             .ok_or_else(|| ApiError::invalid("user", "unknown development user"))?;
         let token = app.auth.lock().expect("auth lock").user_tokens[idx].clone();
         let mut resp = json_response(200, json!({ "data": { "user": user }, "request_id": rid }));
-        resp.headers_mut()
-            .append(header::SET_COOKIE, session_cookie("nari_session", &token));
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            session_cookie("nari_session", &token, app.secure_cookies),
+        );
         Ok(resp)
     }
     .await;
@@ -1202,7 +1224,7 @@ async fn session_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Re
         .session(&mut auth, &headers, "nari_session")
         .filter(|s| !s.controller)
         .map(|s| {
-            let (label, id) = s.actor.unwrap_or(("", ""));
+            let (label, id) = s.actor.clone().unwrap_or_default();
             json!({ "id": id, "label": label, "csrf": s.csrf })
         });
     let dev = app
@@ -1224,6 +1246,148 @@ async fn session_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Re
         )
     };
     secure_headers(resp)
+}
+
+#[cfg(feature = "oidc")]
+async fn login_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let rid = new_uuid();
+    let result = app.guard(&headers, false).and_then(|_| {
+        let o = app.oidc.as_ref().ok_or_else(ApiError::not_found)?;
+        o.begin()
+    });
+    let resp = match result {
+        Ok((url, state)) => {
+            let mut resp = redirect(&url);
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                cookie_header(
+                    "nari_login",
+                    &state,
+                    "SameSite=Lax; Path=/_nari/callback; Max-Age=600",
+                    app.secure_cookies,
+                ),
+            );
+            resp
+        }
+        Err(e) => error_response(e, &rid),
+    };
+    secure_headers(resp)
+}
+
+#[cfg(feature = "oidc")]
+async fn callback_route(
+    State(app): State<Arc<Shared>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let rid = new_uuid();
+    let result: Result<Response, ApiError> = async {
+        app.guard(&headers, false)?;
+        let o = app.oidc.as_ref().ok_or_else(ApiError::not_found)?;
+        let params: HashMap<String, String> =
+            openidconnect::url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        if params.contains_key("error") {
+            return Err(ApiError::new(
+                401,
+                "UNAUTHENTICATED",
+                "the identity provider did not complete the sign-in",
+            ));
+        }
+        let state = params.get("state").map(String::as_str).unwrap_or_default();
+        let code = params.get("code").map(String::as_str).unwrap_or_default();
+        let expected = cookie(&headers, "nari_login").unwrap_or_default();
+        if state.is_empty() || code.is_empty() || !same(state, expected) {
+            return Err(ApiError::new(
+                401,
+                "UNAUTHENTICATED",
+                "sign-in state does not match this browser",
+            ));
+        }
+        let (subject, label) = o.finish(state, code).await?;
+        let actor = oidc_actor(&o.issuer, &subject);
+        let token = random_hex(32);
+        {
+            let mut auth = app.auth.lock().expect("auth lock");
+            let now = Instant::now();
+            auth.sessions.retain(|_, s| s.expires > now);
+            if auth.sessions.len() >= MAX_SESSIONS {
+                return Err(ApiError::new(
+                    503,
+                    "UNAVAILABLE",
+                    "too many active sessions; retry later",
+                ));
+            }
+            auth.sessions.insert(
+                token.clone(),
+                Session {
+                    actor: Some((label, actor)),
+                    csrf: random_hex(32),
+                    controller: false,
+                    expires: now + SESSION_TTL,
+                },
+            );
+        }
+        let mut resp = redirect(app.spec.routes.first().copied().unwrap_or("/"));
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            session_cookie("nari_session", &token, app.secure_cookies),
+        );
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            cookie_header(
+                "nari_login",
+                "",
+                "SameSite=Lax; Path=/_nari/callback; Max-Age=0",
+                app.secure_cookies,
+            ),
+        );
+        Ok(resp)
+    }
+    .await;
+    secure_headers(result.unwrap_or_else(|e| error_response(e, &rid)))
+}
+
+async fn logout_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let rid = new_uuid();
+    let result: Result<Response, ApiError> = (|| {
+        app.guard(&headers, true)?;
+        let token = cookie(&headers, "nari_session")
+            .unwrap_or_default()
+            .to_string();
+        let mut auth = app.auth.lock().expect("auth lock");
+        let s = app
+            .session(&mut auth, &headers, "nari_session")
+            .filter(|s| !s.controller)
+            .ok_or_else(|| ApiError::new(401, "UNAUTHENTICATED", "no session"))?;
+        if !same(
+            header_str(&headers, "x-nari-csrf").unwrap_or_default(),
+            &s.csrf,
+        ) {
+            return Err(ApiError::new(
+                403,
+                "FORBIDDEN",
+                "missing or invalid X-Nari-CSRF header",
+            ));
+        }
+        auth.sessions.remove(&token);
+        let mut resp = json_response(
+            200,
+            json!({ "data": { "signed_out": true }, "request_id": rid }),
+        );
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            cookie_header(
+                "nari_session",
+                "",
+                "SameSite=Strict; Path=/; Max-Age=0",
+                app.secure_cookies,
+            ),
+        );
+        Ok(resp)
+    })();
+    secure_headers(result.unwrap_or_else(|e| error_response(e, &rid)))
 }
 
 async fn health_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
@@ -1315,6 +1479,8 @@ pub enum DbTarget {
 }
 
 pub struct Config {
+    pub public_url: Option<String>,
+    pub oidc_client_secret: Option<String>,
     pub mutations_per_minute: usize,
     pub database: DbTarget,
     pub bind: std::net::IpAddr,
@@ -1350,7 +1516,26 @@ impl Config {
             Ok(b) => b.parse().map_err(|_| format!("invalid NARI_BIND '{b}'"))?,
             Err(_) => std::net::IpAddr::from([127, 0, 0, 1]),
         };
+        let public_url = match std::env::var("NARI_PUBLIC_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        {
+            Some(u) => {
+                let u = u.trim_end_matches('/').to_string();
+                if public_authority(&u).is_none() {
+                    return Err(format!(
+                        "invalid NARI_PUBLIC_URL '{u}': use http(s)://host[:port] without a path"
+                    ));
+                }
+                Some(u)
+            }
+            None => None,
+        };
         Ok(Config {
+            public_url,
+            oidc_client_secret: std::env::var("NARI_OIDC_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
             database,
             bind,
             port,
@@ -1368,6 +1553,230 @@ impl Config {
                 Err(_) => MUTATIONS_PER_MINUTE,
             },
         })
+    }
+}
+
+fn public_authority(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let ok = matches!(scheme, "http" | "https")
+        && !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b));
+    ok.then_some((scheme, rest))
+}
+
+pub fn oidc_actor(issuer: &str, subject: &str) -> String {
+    let digest =
+        Sha256::digest(format!("nari-oidc-actor:{}:{issuer}{subject}", issuer.len()).as_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    b[6] = (b[6] & 0x0f) | 0x80;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+#[cfg(feature = "oidc")]
+fn redirect(location: &str) -> Response {
+    let mut resp = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(location) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    resp
+}
+
+#[cfg(feature = "oidc")]
+mod oidc {
+    use super::*;
+    use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
+    use openidconnect::{
+        AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
+        EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+        TokenResponse,
+    };
+
+    type Client = CoreClient<
+        EndpointSet,
+        EndpointNotSet,
+        EndpointNotSet,
+        EndpointNotSet,
+        EndpointMaybeSet,
+        EndpointMaybeSet,
+    >;
+
+    const MAX_PENDING: usize = 10_000;
+    const LOGIN_TTL: Duration = Duration::from_secs(600);
+
+    struct Pending {
+        verifier: String,
+        nonce: String,
+        expires: Instant,
+    }
+
+    pub struct Oidc {
+        pub issuer: String,
+        client_id: String,
+        secret: Option<String>,
+        redirect: String,
+        client: Mutex<Client>,
+        http: openidconnect::reqwest::Client,
+        pending: Mutex<HashMap<String, Pending>>,
+    }
+
+    async fn discover(
+        http: &openidconnect::reqwest::Client,
+        issuer: &str,
+        client_id: &str,
+        secret: Option<&str>,
+        redirect: &str,
+    ) -> Result<Client, String> {
+        let url = IssuerUrl::new(issuer.to_string()).map_err(|e| e.to_string())?;
+        let meta = CoreProviderMetadata::discover_async(url, http)
+            .await
+            .map_err(|e| format!("OIDC discovery for {issuer} failed: {e}"))?;
+        let redirect = RedirectUrl::new(redirect.to_string()).map_err(|e| e.to_string())?;
+        Ok(CoreClient::from_provider_metadata(
+            meta,
+            ClientId::new(client_id.to_string()),
+            secret.map(|s| ClientSecret::new(s.to_string())),
+        )
+        .set_redirect_uri(redirect))
+    }
+
+    fn rejected() -> ApiError {
+        ApiError::new(401, "UNAUTHENTICATED", "sign-in failed; try again")
+    }
+
+    impl Oidc {
+        pub async fn start(
+            issuer: &str,
+            client_id: &str,
+            secret: Option<String>,
+            public_url: &str,
+        ) -> Result<Oidc, String> {
+            let http = openidconnect::reqwest::ClientBuilder::new()
+                .redirect(openidconnect::reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let redirect = format!("{public_url}/_nari/callback");
+            let client = discover(&http, issuer, client_id, secret.as_deref(), &redirect).await?;
+            Ok(Oidc {
+                issuer: issuer.to_string(),
+                client_id: client_id.to_string(),
+                secret,
+                redirect,
+                client: Mutex::new(client),
+                http,
+                pending: Mutex::new(HashMap::new()),
+            })
+        }
+
+        pub fn begin(&self) -> Result<(String, String), ApiError> {
+            let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+            let client = self.client.lock().expect("oidc lock").clone();
+            let (url, state, nonce) = client
+                .authorize_url(
+                    CoreAuthenticationFlow::AuthorizationCode,
+                    CsrfToken::new_random,
+                    Nonce::new_random,
+                )
+                .add_scope(Scope::new("email".to_string()))
+                .set_pkce_challenge(challenge)
+                .url();
+            let mut pending = self.pending.lock().expect("pending lock");
+            let now = Instant::now();
+            pending.retain(|_, p| p.expires > now);
+            if pending.len() >= MAX_PENDING {
+                return Err(ApiError::new(
+                    503,
+                    "UNAVAILABLE",
+                    "too many sign-ins in progress; retry shortly",
+                ));
+            }
+            pending.insert(
+                state.secret().clone(),
+                Pending {
+                    verifier: verifier.secret().clone(),
+                    nonce: nonce.secret().clone(),
+                    expires: now + LOGIN_TTL,
+                },
+            );
+            Ok((url.to_string(), state.secret().clone()))
+        }
+
+        pub async fn finish(&self, state: &str, code: &str) -> Result<(String, String), ApiError> {
+            let p = self
+                .pending
+                .lock()
+                .expect("pending lock")
+                .remove(state)
+                .filter(|p| p.expires > Instant::now())
+                .ok_or_else(|| {
+                    ApiError::new(401, "UNAUTHENTICATED", "sign-in expired or already used")
+                })?;
+            let client = self.client.lock().expect("oidc lock").clone();
+            let token = client
+                .exchange_code(AuthorizationCode::new(code.to_string()))
+                .map_err(|e| {
+                    log(&format!("OIDC token endpoint missing: {e}"));
+                    rejected()
+                })?
+                .set_pkce_verifier(PkceCodeVerifier::new(p.verifier))
+                .request_async(&self.http)
+                .await
+                .map_err(|e| {
+                    log(&format!("OIDC code exchange failed: {e}"));
+                    rejected()
+                })?;
+            let id_token = token.id_token().ok_or_else(|| {
+                log("OIDC token response has no id_token");
+                rejected()
+            })?;
+            let nonce = Nonce::new(p.nonce);
+            let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
+                Ok(c) => c.clone(),
+                Err(first) => {
+                    let fresh = discover(
+                        &self.http,
+                        &self.issuer,
+                        &self.client_id,
+                        self.secret.as_deref(),
+                        &self.redirect,
+                    )
+                    .await
+                    .map_err(|e| {
+                        log(&e);
+                        rejected()
+                    })?;
+                    let claims = id_token
+                        .claims(&fresh.id_token_verifier(), &nonce)
+                        .map_err(|e| {
+                            log(&format!(
+                                "OIDC ID token rejected: {first}; after refresh: {e}"
+                            ));
+                            rejected()
+                        })?
+                        .clone();
+                    *self.client.lock().expect("oidc lock") = fresh;
+                    claims
+                }
+            };
+            let subject = claims.subject().as_str().to_string();
+            let label = claims
+                .email()
+                .map(|e| e.as_str().to_string())
+                .unwrap_or_else(|| subject.clone());
+            Ok((subject, label))
+        }
     }
 }
 
@@ -1837,17 +2246,56 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
+    let dev = matches!(spec.identity, Identity::LocalDev);
+    let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let mut origins = vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ];
+    if let Some((_, authority)) = cfg.public_url.as_deref().and_then(public_authority) {
+        hosts.push(authority.to_string());
+        origins.extend(cfg.public_url.clone());
+    }
+    let secure_cookies = cfg
+        .public_url
+        .as_deref()
+        .is_some_and(|u| u.starts_with("https://"));
+    #[cfg(feature = "oidc")]
+    let oidc = match spec.identity {
+        Identity::Oidc { issuer, client_id } => {
+            let Some(public) = cfg.public_url.as_deref() else {
+                log(
+                    "identity mode oidc needs NARI_PUBLIC_URL, the URL browsers use to reach this app",
+                );
+                return ExitCode::from(EXIT_CONFIG);
+            };
+            match oidc::Oidc::start(issuer, client_id, cfg.oidc_client_secret.clone(), public).await
+            {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    log(&e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Identity::LocalDev => None,
+    };
+    #[cfg(not(feature = "oidc"))]
+    if !dev {
+        log("identity mode oidc needs a runtime built with the oidc feature");
+        return ExitCode::from(EXIT_CONFIG);
+    }
     let mut auth = Auth {
         sessions: HashMap::new(),
         user_tokens: Vec::new(),
-        bootstrap: Some((random_hex(32), Instant::now() + BOOTSTRAP_TTL)),
+        bootstrap: dev.then(|| (random_hex(32), Instant::now() + BOOTSTRAP_TTL)),
     };
-    for (_, label, id) in SEEDED_USERS {
+    for (_, label, id) in SEEDED_USERS.iter().filter(|_| dev) {
         let token = random_hex(32);
         auth.sessions.insert(
             token.clone(),
             Session {
-                actor: Some((label, id)),
+                actor: Some((label.to_string(), id.to_string())),
                 csrf: random_hex(32),
                 controller: false,
                 expires: Instant::now() + SESSION_TTL,
@@ -1870,11 +2318,8 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         rate: Mutex::new(HashMap::new()),
         permits: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         writer: Arc::new(AsyncMutex::new(())),
-        hosts: vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
-        origins: vec![
-            format!("http://127.0.0.1:{port}"),
-            format!("http://localhost:{port}"),
-        ],
+        hosts,
+        origins,
         instance: new_uuid(),
         owner_hash: cfg.owner_token.as_deref().map(|t| sha256_hex(t.as_bytes())),
         owner_token: cfg.owner_token.clone(),
@@ -1882,17 +2327,30 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
         mutations_per_minute: cfg.mutations_per_minute,
         shutdown: tx,
         telemetry,
+        secure_cookies,
+        #[cfg(feature = "oidc")]
+        oidc,
     });
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/api/actions/{name}", post(action_route))
-        .route("/_nari/bootstrap", post(bootstrap_route))
-        .route("/_nari/dev/select", post(select_route))
+        .route("/_nari/logout", post(logout_route))
         .route("/_nari/session", get(session_route))
         .route("/_nari/health", get(health_route))
         .route("/_nari/metrics", get(metrics_route))
         .route("/_nari/control/shutdown", post(shutdown_route))
-        .fallback(static_route)
-        .with_state(shared.clone());
+        .fallback(static_route);
+    if dev {
+        router = router
+            .route("/_nari/bootstrap", post(bootstrap_route))
+            .route("/_nari/dev/select", post(select_route));
+    }
+    #[cfg(feature = "oidc")]
+    if !dev {
+        router = router
+            .route("/_nari/login", get(login_route))
+            .route("/_nari/callback", get(callback_route));
+    }
+    let router = router.with_state(shared.clone());
     if cfg.supervised {
         let stop = shared.shutdown.clone();
         tokio::spawn(async move {
@@ -1925,7 +2383,9 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
             }
         });
     }
-    println!("NARI_BOOTSTRAP http://127.0.0.1:{port}/#bootstrap={bootstrap}");
+    if dev {
+        println!("NARI_BOOTSTRAP http://127.0.0.1:{port}/#bootstrap={bootstrap}");
+    }
     println!(
         "NARI_READY {}",
         json!({ "port": port, "instance": shared.instance, "pid": std::process::id(), "source_sha256": spec.source_sha256 })
@@ -1949,6 +2409,26 @@ async fn serve(spec: &'static AppSpec) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oidc_actors_are_stable_canonical_uuids_per_issuer() {
+        let a = oidc_actor("https://a.example", "alice");
+        assert!(is_canonical_uuid(&a), "{a}");
+        assert_eq!(&a[14..15], "8");
+        assert!("89ab".contains(&a[19..20]));
+        assert_eq!(a, oidc_actor("https://a.example", "alice"));
+        assert_ne!(a, oidc_actor("https://b.example", "alice"));
+        assert_ne!(
+            oidc_actor("https://a.example", "x\0y"),
+            oidc_actor("https://a.example\0x", "y")
+        );
+        assert_eq!(
+            public_authority("https://tasks.example.test:8443"),
+            Some(("https", "tasks.example.test:8443"))
+        );
+        assert_eq!(public_authority("https://tasks.example.test/app"), None);
+        assert_eq!(public_authority("ftp://x"), None);
+    }
 
     #[tokio::test]
     async fn telemetry_drops_when_full_and_aggregates_batches() {

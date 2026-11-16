@@ -17,6 +17,27 @@ const UNSUPPORTED_BLOCKS: &[&str] = &[
     "test",
     "secret",
 ];
+fn issuer_problem(v: &str) -> Option<&'static str> {
+    let rest = if let Some(r) = v.strip_prefix("https://") {
+        r
+    } else if let Some(r) = v.strip_prefix("http://") {
+        let host = r.split(['/', ':']).next().unwrap_or_default();
+        if host != "127.0.0.1" && host != "localhost" {
+            return Some("must use https (plain http is allowed only for 127.0.0.1 and localhost)");
+        }
+        r
+    } else {
+        return Some("must be an https URL");
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        return Some("has no host");
+    }
+    if rest.contains(['?', '#', ' ', '@']) || !rest.is_ascii() {
+        return Some("must not contain a query, fragment, credentials or spaces");
+    }
+    None
+}
+
 const RESERVED_ROUTES: &[&str] = &["/api", "/_nari", "/assets"];
 const RESERVED_DB_DIRS: &[&str] = &[
     "generated",
@@ -449,17 +470,67 @@ impl<'a> Checker<'a> {
 
     fn identity(&mut self, b: &'a Block) -> Option<Identity> {
         let id = self.id(&["identity", &b.name.name]);
-        let s = self.scope(id.clone(), b.span, &b.entries, &["mode"], &[], false);
+        let s = self.scope(
+            id.clone(),
+            b.span,
+            &b.entries,
+            &["mode", "issuer", "client_id"],
+            &[],
+            false,
+        );
         let mode = self.one_of(
             &s,
             "mode",
-            &["local_dev"],
-            &["oidc", "oauth", "saml", "password", "production"],
+            &["local_dev", "oidc"],
+            &["oauth", "saml", "password", "production"],
         )?;
+        if mode == "local_dev" {
+            for key in ["issuer", "client_id"] {
+                if let Some(p) = s.props.get(key) {
+                    self.err(
+                        "E_UNKNOWN_PROPERTY",
+                        format!("{key} applies only to mode = oidc"),
+                        p.key.span,
+                        &id,
+                    );
+                }
+            }
+            return Some(Identity {
+                id,
+                name: b.name.name.clone(),
+                mode: mode.into(),
+                issuer: None,
+                client_id: None,
+            });
+        }
+        let issuer =
+            self.string(&s, "issuer", true)
+                .and_then(|(v, span)| match issuer_problem(v) {
+                    Some(p) => {
+                        self.err("E_VALUE", format!("issuer '{v}' {p}"), span, &id);
+                        None
+                    }
+                    None => Some(v.to_string()),
+                });
+        let client_id = self.string(&s, "client_id", true).and_then(|(v, span)| {
+            if v.len() <= 255 && v.bytes().all(|c| c.is_ascii_graphic()) {
+                Some(v.to_string())
+            } else {
+                self.err(
+                    "E_VALUE",
+                    "client_id must be 1..255 visible ASCII characters",
+                    span,
+                    &id,
+                );
+                None
+            }
+        });
         Some(Identity {
             id,
             name: b.name.name.clone(),
             mode: mode.into(),
+            issuer: Some(issuer?),
+            client_id: Some(client_id?),
         })
     }
 

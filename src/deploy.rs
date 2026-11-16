@@ -17,6 +17,9 @@ pub struct PlanOptions {
     pub port: Option<u16>,
     pub database_url_env: Option<String>,
     pub production: bool,
+    pub public_url: Option<String>,
+    pub oidc_secret_env: Option<String>,
+    pub publish_address: Option<std::net::IpAddr>,
 }
 
 pub struct Released {
@@ -269,15 +272,31 @@ fn plans_dir(p: &Project) -> Result<PathBuf, Fail> {
 }
 
 pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
-    if o.production {
+    let oidc = c.app.identity.mode == "oidc";
+    if o.production && !oidc {
         return Err((
             4,
             "E_DEV_IDENTITY",
             format!(
-                "production plans need a production identity adapter, and {} declares identity mode {}; plan a preview instead, which publishes on host loopback only",
+                "production plans need a production identity adapter, and {} declares identity mode {}; declare mode = oidc, or plan a preview, which publishes on host loopback only",
                 c.file, c.app.identity.mode
             ),
         ));
+    }
+    if !oidc && (o.public_url.is_some() || o.oidc_secret_env.is_some()) {
+        return Err(usage(
+            "--public-url and --oidc-secret-env apply only to identity mode oidc".into(),
+        ));
+    }
+    if !o.production && o.publish_address.is_some_and(|a| !a.is_loopback()) {
+        return Err(usage(
+            "preview plans publish on loopback only; use --production to publish elsewhere".into(),
+        ));
+    }
+    if let Some(v) = &o.oidc_secret_env
+        && !valid_env_name(v)
+    {
+        return Err(usage(format!("invalid environment variable name '{v}'")));
     }
     let name = o
         .name
@@ -297,6 +316,44 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
     if port < 1024 {
         return Err(usage(format!("port {port} is outside 1024..65535")));
     }
+    let public_url = match (&o.public_url, oidc) {
+        (Some(u), _) => Some(u.trim_end_matches('/').to_string()),
+        (None, true) if !o.production => Some(format!("http://127.0.0.1:{port}")),
+        (None, true) => {
+            return Err(usage(
+                "production plans for oidc apps need --public-url https://<host>".into(),
+            ));
+        }
+        (None, false) => None,
+    };
+    if let Some(u) = &public_url {
+        let host = u
+            .strip_prefix("https://")
+            .or_else(|| u.strip_prefix("http://"))
+            .unwrap_or_default();
+        let valid = !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b));
+        if !valid {
+            return Err(usage(format!(
+                "invalid --public-url '{u}': use http(s)://host[:port] without a path"
+            )));
+        }
+        if o.production && !u.starts_with("https://") {
+            return Err(usage(format!(
+                "production plans need an https --public-url, not '{u}'"
+            )));
+        }
+    }
+    let address = o
+        .publish_address
+        .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
+    let environment = if o.production {
+        "production"
+    } else {
+        "preview"
+    };
     let target = connectivity()?;
     let volume = o.database_url_env.is_none().then(|| format!("{name}-data"));
     let observed = observe(&name, volume.as_deref());
@@ -330,19 +387,30 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
             "action": if observed["volume"] == true { "keep" } else { "create" },
         }));
     }
-    let secrets = match &o.database_url_env {
-        Some(var) => json!({ "NARI_DATABASE_URL": format!("env:{var}") }),
-        None => json!({}),
+    let mut secrets = json!({});
+    if let Some(var) = &o.database_url_env {
+        secrets["NARI_DATABASE_URL"] = json!(format!("env:{var}"));
+    }
+    if let Some(var) = &o.oidc_secret_env {
+        secrets["NARI_OIDC_CLIENT_SECRET"] = json!(format!("env:{var}"));
+    }
+    let mut env = json!({ "NARI_PORT": port.to_string() });
+    if let Some(u) = &public_url {
+        env["NARI_PUBLIC_URL"] = json!(u);
+    }
+    let publish = match address {
+        std::net::IpAddr::V6(a) => format!("[{a}]:{port}:{port}/tcp"),
+        std::net::IpAddr::V4(a) => format!("{a}:{port}:{port}/tcp"),
     };
     resources.push(json!({
         "kind": "container",
         "name": name,
         "action": if observed["container"].is_null() { "create" } else { "replace" },
         "image": artifact["digest"],
-        "publish": format!("127.0.0.1:{port}:{port}/tcp"),
+        "publish": publish,
         "port": port,
         "restart": format!("on-failure:{}", c.app.recovery.max_restarts),
-        "env": { "NARI_PORT": port.to_string() },
+        "env": env,
         "secrets": secrets,
     }));
     let database = match &o.database_url_env {
@@ -359,7 +427,7 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
     let plan = json!({
         "schema": "nari-plan/0.1",
         "adapter": ADAPTER,
-        "environment": "preview",
+        "environment": environment,
         "app": {
             "name": c.app.name,
             "source_file": c.file,
@@ -368,7 +436,17 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
             "policy_sha256": pipeline::policy_hash(c),
             "schema_fingerprint": schema["to"],
         },
-        "authentication": { "mode": c.app.identity.mode, "exposure": "host loopback only" },
+        "authentication": {
+            "mode": c.app.identity.mode,
+            "issuer": c.app.identity.issuer,
+            "client_id": c.app.identity.client_id,
+            "public_url": public_url,
+            "exposure": if address.is_loopback() {
+                "host loopback only".to_string()
+            } else {
+                format!("{address} port {port}; terminate TLS for {} in front of it", public_url.as_deref().unwrap_or_default())
+            },
+        },
         "connectivity": target,
         "database": database,
         "artifact": artifact,
@@ -572,7 +650,6 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
         docker(&["stop", "-t", "15", &name])?;
         docker(&["rename", &name, &prev_name])?;
     }
-    let port = spec["port"].as_u64().unwrap_or_default();
     let mut args: Vec<String> = [
         "run",
         "-d",
@@ -582,8 +659,6 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
         spec["restart"].as_str().unwrap_or("no"),
         "-p",
         spec["publish"].as_str().unwrap_or_default(),
-        "-e",
-        &format!("NARI_PORT={port}"),
         "--label",
         &format!("nari.plan={hash}"),
         "--label",
@@ -592,6 +667,12 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
     .iter()
     .map(|s| s.to_string())
     .collect();
+    for (key, value) in spec["env"].as_object().into_iter().flatten() {
+        args.extend([
+            "-e".into(),
+            format!("{key}={}", value.as_str().unwrap_or_default()),
+        ]);
+    }
     if let Some(v) = &volume {
         args.extend([
             "-v".into(),

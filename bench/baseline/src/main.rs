@@ -152,6 +152,7 @@ fn complete_task(ctx: rt::Ctx, input: rt::Input) -> rt::HandlerFuture {
 
 static SPEC: rt::AppSpec = rt::AppSpec {
     name: "fieldwork-baseline",
+    identity: rt::Identity::LocalDev,
     source_sha256: "hand-written",
     semantic_sha256: "hand-written",
     schema_fingerprint: "fieldwork-baseline-v1",
