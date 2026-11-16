@@ -85,10 +85,29 @@ enum Command {
         #[arg(long, help = "Smaller workload (still 5 measured runs after warmup)")]
         quick: bool,
     },
-    #[command(about = "Production planning (unsupported in 0.1)")]
-    Plan,
-    #[command(about = "Production release (unsupported in 0.1)")]
-    Release,
+    #[command(about = "Build the Docker image and write a reviewable deployment plan")]
+    Plan {
+        #[arg(long, help = "Container name (default nari-<app>)")]
+        name: Option<String>,
+        #[arg(
+            long,
+            help = "Host loopback port to publish (default: the declared port)"
+        )]
+        port: Option<u16>,
+        #[arg(
+            long,
+            value_name = "VAR",
+            help = "Use PostgreSQL; the URL is read from this environment variable at release"
+        )]
+        database_url_env: Option<String>,
+        #[arg(
+            long,
+            help = "Plan a production environment (needs a production identity adapter)"
+        )]
+        production: bool,
+    },
+    #[command(about = "Apply a reviewed deployment plan, identified by its hash")]
+    Release { plan: String },
 }
 
 struct Failure {
@@ -214,11 +233,21 @@ fn run(cli: Cli, json: bool) -> CmdResult {
         }
         Command::Context { id, max_bytes } => context(&project(cli.project)?, &id, max_bytes),
         Command::Diff { base } => diff(&project(cli.project)?, base),
-        Command::Plan | Command::Release => Err(Failure::new(
-            2,
-            "E_UNSUPPORTED_FEATURE",
-            "production planning and release are not available in Imanari 0.1 (local_dev identity only)",
-        )),
+        Command::Plan {
+            name,
+            port,
+            database_url_env,
+            production,
+        } => plan(
+            &project(cli.project)?,
+            &imanari::deploy::PlanOptions {
+                name,
+                port,
+                database_url_env,
+                production,
+            },
+        ),
+        Command::Release { plan } => release(&project(cli.project)?, &plan),
     }
 }
 
@@ -473,6 +502,95 @@ fn build(p: &Project) -> CmdResult {
         ),
         json!({ "ok": true, "manifest": built.manifest }),
     )
+}
+
+fn deploy_failure((exit, code, message): imanari::deploy::Fail) -> Failure {
+    Failure::new(exit, code, message)
+}
+
+fn plan(p: &Project, o: &imanari::deploy::PlanOptions) -> CmdResult {
+    let (_, c, _) = load(p)?;
+    let r = imanari::deploy::plan(p, &c, o).map_err(deploy_failure)?;
+    let plan = &r["plan"];
+    let mut human = format!(
+        "plan {} ({} on {} {}, Docker {} {}/{})",
+        r["plan_sha256"].as_str().unwrap_or_default(),
+        plan["environment"].as_str().unwrap_or_default(),
+        plan["adapter"].as_str().unwrap_or_default(),
+        plan["connectivity"]["endpoint"]
+            .as_str()
+            .unwrap_or_default(),
+        plan["connectivity"]["server_version"]
+            .as_str()
+            .unwrap_or_default(),
+        plan["connectivity"]["os"].as_str().unwrap_or_default(),
+        plan["connectivity"]["arch"].as_str().unwrap_or_default(),
+    );
+    for res in plan["resources"].as_array().into_iter().flatten() {
+        let what = match res["kind"].as_str() {
+            Some("image") => format!(
+                "{} {}",
+                res["ref"].as_str().unwrap_or_default(),
+                res["digest"].as_str().unwrap_or_default()
+            ),
+            Some("container") => format!(
+                "{} {}, {}, restart {}",
+                res["name"].as_str().unwrap_or_default(),
+                res["action"].as_str().unwrap_or_default(),
+                res["publish"].as_str().unwrap_or_default(),
+                res["restart"].as_str().unwrap_or_default()
+            ),
+            _ => format!(
+                "{} {}",
+                res["name"].as_str().unwrap_or_default(),
+                res["action"].as_str().unwrap_or_default()
+            ),
+        };
+        human.push_str(&format!(
+            "\n  {}: {what}",
+            res["kind"].as_str().unwrap_or_default()
+        ));
+    }
+    let steps: Vec<&str> = plan["schema_transition"]["automatic"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str())
+        .collect();
+    human.push_str(&format!(
+        "\n  schema: {}\n  database: {}\n  identity: {}, {}\n  cost: ${}/month as of {} ({})\napply with: nari release {}",
+        if steps.is_empty() {
+            "no migration".to_string()
+        } else {
+            steps.join(", ")
+        },
+        plan["database"]["engine"].as_str().unwrap_or_default(),
+        plan["authentication"]["mode"].as_str().unwrap_or_default(),
+        plan["authentication"]["exposure"].as_str().unwrap_or_default(),
+        plan["estimated_cost"]["monthly_usd"],
+        plan["estimated_cost"]["as_of"].as_str().unwrap_or_default(),
+        plan["estimated_cost"]["basis"].as_str().unwrap_or_default(),
+        r["plan_sha256"].as_str().unwrap_or_default(),
+    ));
+    out(
+        human,
+        json!({ "ok": true, "plan_sha256": r["plan_sha256"], "plan": r["plan"] }),
+    )
+}
+
+fn release(p: &Project, hash: &str) -> CmdResult {
+    let (_, c, _) = load(p)?;
+    let r = imanari::deploy::release(p, &c, hash).map_err(deploy_failure)?;
+    let mut human = format!(
+        "released {} ({}) as release {}",
+        r.record["name"].as_str().unwrap_or_default(),
+        r.record["image"].as_str().unwrap_or_default(),
+        r.record["release_id"].as_str().unwrap_or_default()
+    );
+    if let Some(url) = &r.bootstrap {
+        human.push_str(&format!("\nopen: {url}"));
+    }
+    out(human, json!({ "ok": true, "release": r.record }))
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, Failure> {

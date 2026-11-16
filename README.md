@@ -11,6 +11,7 @@ This is a local vertical slice. It is not a production platform, and it makes no
 - Rust via rustup. Generated apps pin Rust 1.97.1 through `rust-toolchain.toml`, and rustup installs it on first use.
 - macOS for isolated repair, which uses Seatbelt (`/usr/bin/sandbox-exec`). On other platforms repair runs proposal and static validation only and reports `SANDBOX_UNAVAILABLE`.
 - Network access for the first `nari build`, which downloads crates once. Later builds work offline.
+- Optional: Docker (Engine 23+ with BuildKit) for `nari plan` and `nari release`.
 - Optional: Node 22+ and a Chromium (Playwright's headless shell or Chrome) for the browser journey test, and `c++` for the C++ kernel benchmark.
 
 ## Install
@@ -64,7 +65,8 @@ The first `nari build` compiles Axum, SQLx and Tokio in release mode, which take
 | `nari repair ID --proposer fixture\|file:PATH` | Run the isolated repair pipeline; never releases |
 | `nari apply-repair ID --candidate HASH` | Explicit local apply after rechecking hashes and protected tests |
 | `nari bench [--quick]` | Benchmark report in `.nari/bench/report.json` |
-| `nari plan` / `nari release` | Fail with `E_UNSUPPORTED_FEATURE` in 0.1 |
+| `nari plan [--name N] [--port P] [--database-url-env VAR]` | Build the app's Docker image and write a reviewable plan to `.nari/deploy/plans/<hash>.json` |
+| `nari release HASH` | Apply exactly that plan after hash, source, artifact and drift checks, then wait for readiness |
 
 Every command accepts `--project PATH` and `--json`.
 
@@ -101,17 +103,30 @@ nari --project /tmp/fw apply-repair <incident> --candidate <hash>
 
 `expect.data` is a subset match. `$name.field` substitutes a saved response, `as` is `a`, `b` or omitted (unauthenticated), and `key` pins an idempotency key.
 
+## Deploy with Docker
+
+```sh
+nari plan --port 8080                # builds the image, prints resources, schema changes, cost and the plan hash
+nari release <plan hash>             # applies exactly that plan
+```
+
+A plan names the image digest, the volume or the database secret reference, the container and its port, the restart policy derived from the `recovery` block, the schema migration the release will run, and a cost estimate with its basis and date. `nari release` refuses a plan whose file, source, image or target changed since it was written. It stops the running container, starts the new one, and waits for the app to report ready. If the new container fails, the previous one is restarted, unless the release migrated the schema; then it stays stopped as `<name>-prev` for you to inspect.
+
+Plans are preview deployments: the container is published on the host's loopback interface only, because the app still uses the local development identity. `--production` is refused until a production identity adapter exists. With `--database-url-env VAR`, the container uses PostgreSQL and reads the URL from `VAR` at release time. The value never reaches the plan or the release record, but Docker keeps container environment in its own configuration.
+
 ## Environment
 
 | Variable | Purpose |
 | --- | --- |
 | `NARI_TARGET_DIR` | Cargo target dir for generated apps (default `.nari/build/target`) |
 | `NARI_PORT`, `NARI_DATABASE` | Trusted operator override of the declared port (0 picks a free one) and the database path |
-| `NARI_DATABASE_URL` | A `postgres://` URL. The app then uses PostgreSQL instead of the SQLite file. TLS is not built in yet, so `sslmode=require` fails at startup |
+| `NARI_DATABASE_URL` | A `postgres://` URL. The app then uses PostgreSQL instead of the SQLite file, over TLS when the URL's `sslmode` asks for it (rustls with the bundled webpki roots) |
+| `NARI_BIND` | Trusted operator override of the listen address; deployment images set `0.0.0.0` inside the container |
 | `NARI_FAULT` | Dev and test fault injection: `crash_on_start`, `crash_on_request:<action>`, `crash_before_commit:<action>`, `crash_after_commit:<action>` |
 | `NARI_MUTATIONS_PER_MINUTE` | Operator override of the per-actor mutation limit (default 60); the check still runs |
 | `NARI_SANDBOX=none` | Force the no-isolation path (repair reports `SANDBOX_UNAVAILABLE`) |
 | `NARI_CHROMIUM`, `NARI_REQUIRE_BROWSER` | Browser for the journey test; with `NARI_REQUIRE_BROWSER` set, a missing browser fails the test instead of skipping it |
+| `NARI_REQUIRE_DOCKER` | With it set, a missing Docker engine fails the deployment test instead of skipping it |
 | `NARI_PG_BIN`, `NARI_REQUIRE_POSTGRES` | Directory holding `initdb` for the PostgreSQL tests (found on `PATH` or in Homebrew and Debian locations otherwise); with `NARI_REQUIRE_POSTGRES` set, a missing PostgreSQL fails the tests instead of skipping them |
 
 ## Tests
@@ -154,10 +169,10 @@ Implemented:
 
 Unsupported in 0.1, each rejected with a diagnostic:
 
-- Mobile targets, production identity, TLS connections to PostgreSQL, and migrations that remove, rename or retype stored data.
+- Mobile targets, production identity, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.
 - Public or anonymous access, list filters, and floats or other types beyond Text, Bool, UUID and Int.
-- `automatic_release = true`, and `plan` and `release`.
+- `automatic_release = true`, production deployment plans, and staged (canary) releases.
 - Live LLM proposers.
 
 ## Limits and non-claims

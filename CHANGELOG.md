@@ -8,7 +8,9 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 
 - Additive schema migrations. When an app starts against a database built from an older schema, new entities, new fields with a default, and widened text bounds are applied in one transaction and recorded in `_nari_schema_history`. Changes that would drop or reinterpret stored data still stop startup with `MIGRATION_REQUIRED`, and the message now names each change.
 - `nari diff` lists which schema changes apply automatically and which block startup (`migration.automatic` and `migration.blocked` in JSON).
-- PostgreSQL. Set `NARI_DATABASE_URL` to a `postgres://` URL and the same app binary stores its data in PostgreSQL, with startup migrations, idempotency receipts and revision checks that hold across several instances on one database. TLS is not built in yet, so `sslmode=require` is refused at startup.
+- Docker deployments. `nari plan` builds the app image and writes a reviewable plan with the image digest, resources, schema migration, readiness rule and cost estimate. `nari release HASH` applies exactly that plan after checking the file, source, image and target for drift, waits for readiness, and restarts the previous container if the new one fails. Plans are preview-only (host loopback) until a production identity adapter exists.
+- PostgreSQL connections can use TLS (rustls with webpki roots), following the URL's `sslmode`.
+- PostgreSQL. Set `NARI_DATABASE_URL` to a `postgres://` URL and the same app binary stores its data in PostgreSQL, with startup migrations, idempotency receipts and revision checks that hold across several instances on one database.
 - Request telemetry. Apps count requests per action and status and keep a latency histogram, fed through a bounded queue that counts dropped events instead of blocking. `nari status` shows the numbers for the running worker, and the owner-only `GET /_nari/metrics` returns them as `nari-metrics/0.1` JSON.
 
 ### Changed

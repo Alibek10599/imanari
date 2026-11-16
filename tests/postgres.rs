@@ -43,7 +43,7 @@ fn run(bin: &Path, args: &[&str]) {
 }
 
 impl Cluster {
-    fn start(name: &str) -> Option<Cluster> {
+    fn start(name: &str, tls: bool) -> Option<Cluster> {
         let Some(bin) = pg_bin() else {
             assert!(
                 std::env::var_os("NARI_REQUIRE_POSTGRES").is_none(),
@@ -64,6 +64,33 @@ impl Cluster {
             &bin.join("initdb"),
             &["-D", data_s, "-U", "nari", "--auth=trust", "-E", "UTF8"],
         );
+        if tls {
+            let key = data.join("server.key");
+            run(
+                Path::new("openssl"),
+                &[
+                    "req",
+                    "-new",
+                    "-x509",
+                    "-days",
+                    "1",
+                    "-nodes",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                    "-keyout",
+                    key.to_str().unwrap(),
+                    "-out",
+                    data.join("server.crt").to_str().unwrap(),
+                ],
+            );
+            imanari::artifacts::restrict(&key, 0o600);
+            let conf = data.join("postgresql.conf");
+            let mut text = std::fs::read_to_string(&conf).unwrap();
+            text.push_str(
+                "\nssl = on\nssl_cert_file = 'server.crt'\nssl_key_file = 'server.key'\n",
+            );
+            std::fs::write(&conf, text).unwrap();
+        }
         let log = dir.join("postgres.log");
         run(
             &bin.join("pg_ctl"),
@@ -185,18 +212,21 @@ fn unsupported_database_urls_fail_before_serving() {
 
 #[test]
 fn postgres_backend_keeps_isolation_idempotency_and_revisions_across_instances() {
-    let Some(c) = Cluster::start("pg-app") else {
+    let Some(c) = Cluster::start("pg-app", true) else {
         return;
     };
     let b = fieldwork();
-    let tls = format!(
-        "postgres://nari@127.0.0.1:{}/postgres?sslmode=require",
+    let strict = format!(
+        "postgres://nari@127.0.0.1:{}/postgres?sslmode=verify-full",
         c.port
     );
-    let err = refused(b, &c.dir.join("tls.db"), &tls);
-    assert!(err.contains("TLS"), "{err}");
+    let err = refused(b, &c.dir.join("tls.db"), &strict);
+    assert!(
+        err.contains("certificate"),
+        "an untrusted certificate is refused: {err}"
+    );
 
-    let url = c.database("fieldwork");
+    let url = c.database("fieldwork") + "?sslmode=require";
     let (app, a, other) = on(b, &c, &url);
     let task = create(app.port, &a, "A's secret", "k1");
     assert_eq!(task["owner"], json!(a.actor));
@@ -277,11 +307,16 @@ fn postgres_backend_keeps_isolation_idempotency_and_revisions_across_instances()
         "4",
         "only committed writes keep receipts"
     );
+    let encrypted = c.psql(
+        "fieldwork",
+        "SELECT count(*) FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid) WHERE s.ssl AND a.datname = 'fieldwork' AND a.application_name <> 'psql'",
+    );
+    assert_ne!(encrypted, "0", "the app connects over TLS");
 }
 
 #[test]
 fn postgres_applies_additive_migrations_and_refuses_destructive_ones() {
-    let Some(c) = Cluster::start("pg-migration") else {
+    let Some(c) = Cluster::start("pg-migration", false) else {
         return;
     };
     let b = fieldwork();
