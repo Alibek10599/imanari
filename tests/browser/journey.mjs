@@ -32,7 +32,7 @@ function check(name, ok, detail) {
 let ws;
 try {
   const portFile = join(profile, "DevToolsActivePort");
-  const devPort = await waitFor(() => existsSync(portFile) && readFileSync(portFile, "utf8").split("\n")[0], "devtools", 20000);
+  const devPort = await waitFor(() => existsSync(portFile) && readFileSync(portFile, "utf8").split("\n")[0], "devtools", 60000);
   const targets = await (await fetch(`http://127.0.0.1:${devPort}/json/list`)).json();
   ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
   await new Promise((res, rej) => {
