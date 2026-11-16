@@ -17,6 +17,20 @@ fn mutate(from: &str, to: &str) -> String {
 }
 
 #[test]
+fn oidc_identity_compiles_with_https_or_loopback_issuers() {
+    for issuer in ["https://accounts.example.com", "http://127.0.0.1:8081"] {
+        let src = mutate(
+            "mode = local_dev;",
+            &format!("mode = oidc;\n    issuer = \"{issuer}\";\n    client_id = \"tasks\";"),
+        );
+        let (c, warnings) = compile(&src, FILE).expect("oidc fixture compiles");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c.app.identity.issuer.as_deref(), Some(issuer));
+        assert_eq!(c.app.identity.client_id.as_deref(), Some("tasks"));
+    }
+}
+
+#[test]
 fn fixture_checks_without_diagnostics() {
     let (c, warnings) = compile(FIXTURE, FILE).expect("fixture compiles");
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -298,9 +312,49 @@ fn rejects_invalid_programs_with_useful_spans() {
             Some("true"),
         ),
         (
-            mutate("mode = local_dev;", "mode = oidc;"),
+            mutate("mode = local_dev;", "mode = saml;"),
             "E_UNSUPPORTED_FEATURE",
-            Some("oidc"),
+            Some("saml"),
+        ),
+        (
+            mutate(
+                "mode = local_dev;",
+                "mode = oidc;\n    client_id = \"tasks\";",
+            ),
+            "E_MISSING_PROPERTY",
+            None,
+        ),
+        (
+            mutate(
+                "mode = local_dev;",
+                "mode = oidc;\n    issuer = \"http://idp.example.com\";\n    client_id = \"tasks\";",
+            ),
+            "E_VALUE",
+            Some("\"http://idp.example.com\""),
+        ),
+        (
+            mutate(
+                "mode = local_dev;",
+                "mode = oidc;\n    issuer = \"https://idp.example.com/?x=1\";\n    client_id = \"tasks\";",
+            ),
+            "E_VALUE",
+            Some("\"https://idp.example.com/?x=1\""),
+        ),
+        (
+            mutate(
+                "mode = local_dev;",
+                "mode = oidc;\n    issuer = \"https://idp.example.com\";\n    client_id = \"has space\";",
+            ),
+            "E_VALUE",
+            Some("\"has space\""),
+        ),
+        (
+            mutate(
+                "mode = local_dev;",
+                "mode = local_dev;\n    issuer = \"https://idp.example.com\";",
+            ),
+            "E_UNKNOWN_PROPERTY",
+            Some("issuer"),
         ),
         (
             mutate(

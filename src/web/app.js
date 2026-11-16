@@ -67,6 +67,24 @@
 
   function renderBar() {
     bar.replaceChildren();
+    if (config.identity === "oidc") {
+      bar.setAttribute("aria-label", "Account");
+      if (!session || !session.user) return;
+      const out = el("button", { type: "button", text: "Sign out" });
+      out.addEventListener("click", async () => {
+        out.disabled = true;
+        await fetch("/_nari/logout", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Nari-CSRF": session.user.csrf },
+          body: "{}",
+        });
+        await loadSession();
+        render();
+      });
+      bar.append(el("span", { text: "Signed in as " + session.user.label }), out);
+      return;
+    }
     if (!session || !session.dev) return;
     const id = nextId("dev-user");
     const select = el("select", { id });
@@ -287,10 +305,10 @@
       return;
     }
     if (!session || !session.user) {
-      main.replaceChildren(
-        el("h1", { text: screen.title }),
-        el("p", { role: "alert", text: "Not signed in. Run `nari dev` and open the bootstrap URL it prints." }),
-      );
+      const prompt = config.identity === "oidc"
+        ? el("p", {}, el("a", { href: "/_nari/login", text: "Sign in" }), " to continue.")
+        : el("p", { role: "alert", text: "Not signed in. Run `nari dev` and open the bootstrap URL it prints." });
+      main.replaceChildren(el("h1", { text: screen.title }), prompt);
       return;
     }
     renderScreen(screen);

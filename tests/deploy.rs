@@ -237,4 +237,52 @@ fn docker_plans_release_migrate_refuse_and_roll_back() {
         !stored.contains("canary-secret-7f3a"),
         "secrets never reach plans or release records"
     );
+
+    let mut local = plan_args.to_vec();
+    local.extend(["--public-url", "https://tasks.example.test"]);
+    assert_eq!(failure(&nari(&dir, &local, &[])), (Some(2), "E_USAGE"));
+    let mut wide = plan_args.to_vec();
+    wide.extend(["--publish-address", "0.0.0.0"]);
+    assert_eq!(failure(&nari(&dir, &wide, &[])), (Some(2), "E_USAGE"));
+
+    let oidc = v2.replace(
+        "    mode = local_dev;",
+        "    mode = oidc;\n    issuer = \"https://idp.example.test\";\n    client_id = \"tasks\";",
+    );
+    std::fs::write(&src, &oidc).unwrap();
+    let mut prod = plan_args.to_vec();
+    prod.push("--production");
+    assert_eq!(failure(&nari(&dir, &prod, &[])), (Some(2), "E_USAGE"));
+    prod.extend(["--public-url", "http://tasks.example.test"]);
+    assert_eq!(failure(&nari(&dir, &prod, &[])), (Some(2), "E_USAGE"));
+    prod.truncate(prod.len() - 2);
+    prod.extend([
+        "--public-url",
+        "https://tasks.example.test",
+        "--oidc-secret-env",
+        "NARI_TEST_OIDC_SECRET",
+        "--publish-address",
+        "0.0.0.0",
+    ]);
+    let (exit, v) = nari(&dir, &prod, &[]);
+    assert_eq!(exit, Some(0), "{v}");
+    let plan = &v["plan"];
+    assert_eq!(plan["environment"], "production");
+    assert_eq!(plan["authentication"]["mode"], "oidc");
+    assert_eq!(plan["authentication"]["issuer"], "https://idp.example.test");
+    assert_eq!(
+        plan["authentication"]["public_url"],
+        "https://tasks.example.test"
+    );
+    let container = &plan["resources"][2];
+    assert_eq!(container["publish"], format!("0.0.0.0:{port}:{port}/tcp"));
+    assert_eq!(
+        container["env"]["NARI_PUBLIC_URL"],
+        "https://tasks.example.test"
+    );
+    assert_eq!(
+        container["secrets"],
+        json!({ "NARI_OIDC_CLIENT_SECRET": "env:NARI_TEST_OIDC_SECRET" })
+    );
+    assert_eq!(plan["schema_transition"]["automatic"], json!([]));
 }

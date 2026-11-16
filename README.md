@@ -112,7 +112,19 @@ nari release <plan hash>             # applies exactly that plan
 
 A plan names the image digest, the volume or the database secret reference, the container and its port, the restart policy derived from the `recovery` block, the schema migration the release will run, and a cost estimate with its basis and date. `nari release` refuses a plan whose file, source, image or target changed since it was written. It stops the running container, starts the new one, and waits for the app to report ready. If the new container fails, the previous one is restarted, unless the release migrated the schema; then it stays stopped as `<name>-prev` for you to inspect.
 
-Plans are preview deployments: the container is published on the host's loopback interface only, because the app still uses the local development identity. `--production` is refused until a production identity adapter exists. With `--database-url-env VAR`, the container uses PostgreSQL and reads the URL from `VAR` at release time. The value never reaches the plan or the release record, but Docker keeps container environment in its own configuration.
+A `local_dev` app can only be planned as a preview: the container is published on the host's loopback interface. Production plans (`--production`) need `mode = oidc`, an https `--public-url`, and optionally `--oidc-secret-env VAR` and `--publish-address`; terminate TLS for the public URL in front of the container. With `--database-url-env VAR`, the container uses PostgreSQL and reads the URL from `VAR` at release time. The value never reaches the plan or the release record, but Docker keeps container environment in its own configuration.
+
+## Sign-in with OpenID Connect
+
+```
+identity users {
+  mode = oidc;
+  issuer = "https://accounts.example.com";
+  client_id = "fieldwork";
+}
+```
+
+With `mode = oidc` the app has no seeded users or bootstrap link. `/_nari/login` starts an authorization-code flow with PKCE, a nonce and a state cookie, and `/_nari/callback` exchanges the code and verifies the ID token's signature, issuer, audience, expiry and nonce through the `openidconnect` crate. Each user's actor ID is a UUID derived from the issuer and the token's `sub`, so the same person owns the same rows on every sign-in. The app needs `NARI_PUBLIC_URL` (the URL browsers use, registered with the provider as `<url>/_nari/callback`), and `NARI_OIDC_CLIENT_SECRET` for confidential clients. Session cookies get `Secure` when the public URL is https.
 
 ## Environment
 
@@ -121,6 +133,7 @@ Plans are preview deployments: the container is published on the host's loopback
 | `NARI_TARGET_DIR` | Cargo target dir for generated apps (default `.nari/build/target`) |
 | `NARI_PORT`, `NARI_DATABASE` | Trusted operator override of the declared port (0 picks a free one) and the database path |
 | `NARI_DATABASE_URL` | A `postgres://` URL. The app then uses PostgreSQL instead of the SQLite file, over TLS when the URL's `sslmode` asks for it (rustls with the bundled webpki roots) |
+| `NARI_PUBLIC_URL`, `NARI_OIDC_CLIENT_SECRET` | For `mode = oidc`: the URL browsers use to reach the app, and the client secret if the provider issued one |
 | `NARI_BIND` | Trusted operator override of the listen address; deployment images set `0.0.0.0` inside the container |
 | `NARI_FAULT` | Dev and test fault injection: `crash_on_start`, `crash_on_request:<action>`, `crash_before_commit:<action>`, `crash_after_commit:<action>` |
 | `NARI_MUTATIONS_PER_MINUTE` | Operator override of the per-actor mutation limit (default 60); the check still runs |
@@ -169,7 +182,7 @@ Implemented:
 
 Unsupported in 0.1, each rejected with a diagnostic:
 
-- Mobile targets, production identity, and migrations that remove, rename or retype stored data.
+- Mobile targets, identity providers other than OpenID Connect, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.
 - Public or anonymous access, list filters, and floats or other types beyond Text, Bool, UUID and Int.
 - `automatic_release = true`, production deployment plans, and staged (canary) releases.

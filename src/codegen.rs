@@ -384,6 +384,17 @@ pub fn rust_main(c: &Compiled, fingerprint: &str) -> (String, Vec<Region>) {
     e.region(&app.runtime.id, |e| {
         e.line(0, "static SPEC: rt::AppSpec = rt::AppSpec {");
         e.line(1, &format!("name: {},", rs(&app.name)));
+        match (&app.identity.issuer, &app.identity.client_id) {
+            (Some(issuer), Some(client_id)) => e.line(
+                1,
+                &format!(
+                    "identity: rt::Identity::Oidc {{ issuer: {}, client_id: {} }},",
+                    rs(issuer),
+                    rs(client_id)
+                ),
+            ),
+            _ => e.line(1, "identity: rt::Identity::LocalDev,"),
+        }
         e.line(1, &format!("source_sha256: {},", rs(&c.source_sha256)));
         e.line(1, &format!("semantic_sha256: {},", rs(&c.semantic_sha256)));
         e.line(1, &format!("schema_fingerprint: {},", rs(fingerprint)));
@@ -567,7 +578,7 @@ pub fn web_config(app: &App, source_sha256: &str) -> Json {
             json!({ "route": s.route, "title": s.title, "query": s.query, "entity": ent.name, "forms": forms, "lists": lists })
         })
         .collect();
-    json!({ "app": app.name, "source_sha256": source_sha256, "screens": screens })
+    json!({ "app": app.name, "identity": app.identity.mode, "source_sha256": source_sha256, "screens": screens })
 }
 
 fn html_escape(s: &str) -> String {
@@ -602,9 +613,14 @@ pub fn generate(c: &Compiled, package: &str) -> Generated {
     files.insert(
         "app/Cargo.toml".into(),
         format!(
-            "[package]\nname = {}\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nimanari-runtime = {{ path = {} }}\n\n[profile.release]\ncodegen-units = 16\n\n[workspace]\n",
+            "[package]\nname = {}\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nimanari-runtime = {{ path = {}{} }}\n\n[profile.release]\ncodegen-units = 16\n\n[workspace]\n",
             toml_str(package),
-            toml_str("../runtime")
+            toml_str("../runtime"),
+            if c.app.identity.mode == "oidc" {
+                ", features = [\"oidc\"]"
+            } else {
+                ""
+            }
         ),
     );
     files.insert("runtime/Cargo.toml".into(), RUNTIME_MANIFEST.to_string());
