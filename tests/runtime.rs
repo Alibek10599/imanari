@@ -491,13 +491,29 @@ fn additive_schema_changes_migrate_and_destructive_ones_stop() {
         sql("SELECT \"steps\" FROM \"_nari_schema_history\""),
         vec![r#"["add field Task.notes"]"#.to_string()]
     );
-    let err = start(b, &db, &[])
-        .err()
-        .expect("removing a field refuses to start");
-    assert!(err.contains("MIGRATION_REQUIRED"), "{err}");
-    assert!(err.contains("Task.notes was removed"), "{err}");
+    let (old, a1, _) = app_with_sessions(b, &db, &[]);
+    assert_eq!(
+        items(old.port, &a1).len(),
+        2,
+        "the previous build runs against the expanded schema"
+    );
+    assert_eq!(create(old.port, &a1, "from v1", "m3").status, 200);
+    drop(old);
     let (app3, a3, _) = app_with_sessions(&b2, &db, &[]);
-    assert_eq!(items(app3.port, &a3).len(), 2, "data untouched");
+    let all = items(app3.port, &a3);
+    assert_eq!(all.len(), 3, "data untouched");
+    assert!(all.iter().all(|t| t["notes"] == "it's new"));
+    drop(app3);
+    let retyped = FIXTURE.replace(
+        "    field completed {",
+        "    field notes {\n      type = Int;\n      default = 0;\n    }\n\n    field completed {",
+    );
+    let b3 = build("migration-v3", &retyped);
+    let err = start(&b3, &db, &[])
+        .err()
+        .expect("retyping a field refuses to start");
+    assert!(err.contains("MIGRATION_REQUIRED"), "{err}");
+    assert!(err.contains("type of Task.notes changed"), "{err}");
 }
 
 #[test]

@@ -425,6 +425,13 @@ impl Pool {
         }
     }
 
+    pub async fn execute(&self, sql: &str, args: &[Arg]) -> Result<u64, sqlx::Error> {
+        Ok(match self {
+            Pool::Sqlite(p) => bound!(sql, args).execute(p).await?.rows_affected(),
+            Pool::Postgres(p) => bound!(sql, args).execute(p).await?.rows_affected(),
+        })
+    }
+
     pub async fn fetch_all(
         &self,
         sql: &str,
@@ -932,6 +939,52 @@ impl Shared {
         Ok(())
     }
 
+    async fn hydrate(&self, h: &HeaderMap) {
+        if matches!(self.spec.identity, Identity::LocalDev) {
+            return;
+        }
+        let Some(token) = cookie(h, "nari_session").filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if self
+            .auth
+            .lock()
+            .expect("auth lock")
+            .sessions
+            .contains_key(token)
+        {
+            return;
+        }
+        let now = now_ms();
+        let found = self
+            .db
+            .fetch_all(
+                "SELECT \"actor\", \"label\", \"csrf\", \"expires_ms\" FROM \"_nari_sessions\" WHERE \"token_sha256\" = $1 AND \"expires_ms\" > $2",
+                &[sha256_hex(token.as_bytes()).into(), now.into()],
+                &[
+                    ("actor", Col::Text),
+                    ("label", Col::Text),
+                    ("csrf", Col::Text),
+                    ("expires_ms", Col::Int),
+                ],
+            )
+            .await;
+        let Some(row) = found.ok().and_then(|rows| rows.into_iter().next()) else {
+            return;
+        };
+        let text = |k: &str| row[k].as_str().unwrap_or_default().to_string();
+        let left = u64::try_from(row["expires_ms"].as_i64().unwrap_or(now) - now).unwrap_or(0);
+        self.auth.lock().expect("auth lock").sessions.insert(
+            token.to_string(),
+            Session {
+                actor: Some((text("label"), text("actor"))),
+                csrf: text("csrf"),
+                controller: false,
+                expires: Instant::now() + Duration::from_millis(left),
+            },
+        );
+    }
+
     fn owner(&self, h: &HeaderMap, state_changing: bool) -> bool {
         let token = header_str(h, "x-nari-owner").unwrap_or_default();
         self.guard(h, state_changing).is_ok()
@@ -1080,6 +1133,7 @@ async fn handle_action(
         .iter()
         .find(|a| a.name == name)
         .ok_or_else(|| ApiError::new(404, "UNKNOWN_ACTION", "no such action"))?;
+    app.hydrate(h).await;
     let actor = app.actor(h)?;
     let key = if spec.mutates {
         let key = header_str(h, "idempotency-key").unwrap_or_default();
@@ -1219,6 +1273,7 @@ async fn session_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Re
     if let Err(e) = app.guard(&headers, false) {
         return secure_headers(error_response(e, &rid));
     }
+    app.hydrate(&headers).await;
     let mut auth = app.auth.lock().expect("auth lock");
     let user = app
         .session(&mut auth, &headers, "nari_session")
@@ -1308,6 +1363,7 @@ async fn callback_route(
         let (subject, label) = o.finish(state, code).await?;
         let actor = oidc_actor(&o.issuer, &subject);
         let token = random_hex(32);
+        let csrf = random_hex(32);
         {
             let mut auth = app.auth.lock().expect("auth lock");
             let now = Instant::now();
@@ -1319,16 +1375,36 @@ async fn callback_route(
                     "too many active sessions; retry later",
                 ));
             }
-            auth.sessions.insert(
-                token.clone(),
-                Session {
-                    actor: Some((label, actor)),
-                    csrf: random_hex(32),
-                    controller: false,
-                    expires: now + SESSION_TTL,
-                },
-            );
         }
+        let now = now_ms();
+        let expires = now + SESSION_TTL.as_millis() as i64;
+        app.db
+            .execute(
+                "DELETE FROM \"_nari_sessions\" WHERE \"expires_ms\" <= $1",
+                &[now.into()],
+            )
+            .await?;
+        app.db
+            .execute(
+                "INSERT INTO \"_nari_sessions\" (\"token_sha256\", \"actor\", \"label\", \"csrf\", \"expires_ms\") VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    sha256_hex(token.as_bytes()).into(),
+                    actor.as_str().into(),
+                    label.as_str().into(),
+                    csrf.as_str().into(),
+                    expires.into(),
+                ],
+            )
+            .await?;
+        app.auth.lock().expect("auth lock").sessions.insert(
+            token.clone(),
+            Session {
+                actor: Some((label, actor)),
+                csrf,
+                controller: false,
+                expires: Instant::now() + SESSION_TTL,
+            },
+        );
         let mut resp = redirect(app.spec.routes.first().copied().unwrap_or("/"));
         resp.headers_mut().append(
             header::SET_COOKIE,
@@ -1351,6 +1427,7 @@ async fn callback_route(
 
 async fn logout_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let rid = new_uuid();
+    app.hydrate(&headers).await;
     let result: Result<Response, ApiError> = (|| {
         app.guard(&headers, true)?;
         let token = cookie(&headers, "nari_session")
@@ -1372,6 +1449,7 @@ async fn logout_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Res
             ));
         }
         auth.sessions.remove(&token);
+        drop(auth);
         let mut resp = json_response(
             200,
             json!({ "data": { "signed_out": true }, "request_id": rid }),
@@ -1387,6 +1465,20 @@ async fn logout_route(State(app): State<Arc<Shared>>, headers: HeaderMap) -> Res
         );
         Ok(resp)
     })();
+    let result = match result {
+        Ok(resp) if !matches!(app.spec.identity, Identity::LocalDev) => {
+            let token = cookie(&headers, "nari_session").unwrap_or_default();
+            app.db
+                .execute(
+                    "DELETE FROM \"_nari_sessions\" WHERE \"token_sha256\" = $1",
+                    &[sha256_hex(token.as_bytes()).into()],
+                )
+                .await
+                .map(|_| resp)
+                .map_err(ApiError::from)
+        }
+        other => other,
+    };
     secure_headers(result.unwrap_or_else(|e| error_response(e, &rid)))
 }
 
@@ -2054,6 +2146,14 @@ async fn connect(target: &DbTarget) -> Result<(Pool, bool), OpenError> {
     }
 }
 
+fn sessions_ddl(d: Dialect) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"_nari_sessions\" (\"token_sha256\" TEXT PRIMARY KEY NOT NULL, \"actor\" TEXT NOT NULL, \"label\" TEXT NOT NULL, \"csrf\" TEXT NOT NULL, \"expires_ms\" {} NOT NULL){}",
+        int_type(d),
+        strict(d)
+    )
+}
+
 const STARTUP_LOCK: i64 = 0x6e61_7269_5f6d_6967;
 
 pub async fn open_database(spec: &AppSpec, target: &DbTarget) -> Result<Pool, OpenError> {
@@ -2095,6 +2195,7 @@ pub async fn open_database(spec: &AppSpec, target: &DbTarget) -> Result<Pool, Op
         let strict = strict(d);
         tx.execute(&format!("CREATE TABLE \"_nari_meta\" (\"key\" TEXT PRIMARY KEY NOT NULL, \"value\" TEXT NOT NULL){strict}"), &[])
             .await?;
+        tx.execute(&sessions_ddl(d), &[]).await?;
         tx.execute(&format!("CREATE TABLE \"_nari_receipts\" (\"actor\" TEXT NOT NULL, \"action\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"input_sha256\" TEXT NOT NULL, \"response\" TEXT NOT NULL, \"created_ms\" {int} NOT NULL, PRIMARY KEY (\"actor\", \"action\", \"key\")){strict}"), &[])
             .await?;
         for stmt in shapes.iter().flat_map(|e| entity_ddl(e, d)) {
@@ -2112,6 +2213,7 @@ pub async fn open_database(spec: &AppSpec, target: &DbTarget) -> Result<Pool, Op
         tx.commit().await?;
         return Ok(pool);
     }
+    tx.execute(&sessions_ddl(d), &[]).await?;
     let meta_sql = "SELECT \"value\" FROM \"_nari_meta\" WHERE \"key\" = $1";
     let Some(stored) = tx.text(meta_sql, &["schema_fingerprint".into()]).await? else {
         return Err(OpenError::MigrationRequired(
@@ -2139,8 +2241,17 @@ pub async fn open_database(spec: &AppSpec, target: &DbTarget) -> Result<Pool, Op
     let old: Vec<EntityShape> = serde_json::from_str(&old).map_err(|e| {
         OpenError::MigrationRequired(format!("stored schema shape is unreadable: {e}"))
     })?;
-    let steps = migration_plan(&old, &shapes, d)
-        .map_err(|blocked| OpenError::MigrationRequired(blocked.join("; ")))?;
+    let steps = match migration_plan(&old, &shapes, d) {
+        Ok(steps) => steps,
+        Err(_) if migration_plan(&shapes, &old, d).is_ok() => {
+            tx.commit().await?;
+            log(&format!(
+                "running against newer schema {stored}: it only adds to what this build uses, so it is left unchanged"
+            ));
+            return Ok(pool);
+        }
+        Err(blocked) => return Err(OpenError::MigrationRequired(blocked.join("; "))),
+    };
     let claimed = tx
         .execute(
             "UPDATE \"_nari_meta\" SET \"value\" = $1 WHERE \"key\" = 'schema_fingerprint' AND \"value\" = $2",

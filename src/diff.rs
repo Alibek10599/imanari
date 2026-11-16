@@ -259,13 +259,20 @@ pub fn diff(base: &Compiled, cur: &Compiled) -> Json {
         *summary.entry(ch.category.clone()).or_default() += 1;
     }
     let schema_changed = changes.iter().any(|c| c.category == "data migration");
-    let (automatic, blocked) = match imanari_runtime::migration_plan(
-        &codegen::schema_shape(&base.app),
-        &codegen::schema_shape(&cur.app),
-        imanari_runtime::Dialect::Sqlite,
-    ) {
-        Ok(steps) => (steps.into_iter().map(|s| s.summary).collect(), Vec::new()),
-        Err(blocked) => (Vec::new(), blocked),
+    let (old, new) = (
+        codegen::schema_shape(&base.app),
+        codegen::schema_shape(&cur.app),
+    );
+    let sqlite = imanari_runtime::Dialect::Sqlite;
+    let summaries = |steps: Vec<imanari_runtime::MigrationStep>| -> Vec<String> {
+        steps.into_iter().map(|s| s.summary).collect()
+    };
+    let (automatic, ahead, blocked) = match imanari_runtime::migration_plan(&old, &new, sqlite) {
+        Ok(steps) => (summaries(steps), Vec::new(), Vec::new()),
+        Err(blocked) => match imanari_runtime::migration_plan(&new, &old, sqlite) {
+            Ok(steps) => (Vec::new(), summaries(steps), Vec::new()),
+            Err(_) => (Vec::new(), Vec::new(), blocked),
+        },
     };
     json!({
         "schema": "nari-diff/0.1",
@@ -273,7 +280,7 @@ pub fn diff(base: &Compiled, cur: &Compiled) -> Json {
         "current": { "source_sha256": cur.source_sha256, "semantic_sha256": cur.semantic_sha256 },
         "behavior_changed": base.semantic_sha256 != cur.semantic_sha256,
         "migration_required": !blocked.is_empty(),
-        "migration": { "automatic": automatic, "blocked": blocked },
+        "migration": { "automatic": automatic, "database_ahead_by": ahead, "blocked": blocked },
         "full_validation_required": full || schema_changed,
         "summary": summary,
         "changes": changes,
@@ -317,7 +324,17 @@ pub fn render(d: &Json) -> String {
             .filter_map(|v| v.as_str().map(String::from))
             .collect()
     };
-    let (automatic, blocked) = (list("automatic"), list("blocked"));
+    let (automatic, ahead, blocked) = (
+        list("automatic"),
+        list("database_ahead_by"),
+        list("blocked"),
+    );
+    if !ahead.is_empty() {
+        out.push_str(&format!(
+            "data migration: none; existing databases stay ahead of this build and keep their data ({})\n",
+            ahead.join(", ")
+        ));
+    }
     if !automatic.is_empty() {
         out.push_str(&format!(
             "data migration: applied automatically on the next start: {}\n",

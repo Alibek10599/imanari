@@ -419,6 +419,24 @@ fn oidc_sign_in_verifies_tokens_and_scopes_data_per_subject() {
     );
     assert_eq!(list(&again), 1);
 
+    let port2 = free_port();
+    let second = start(
+        &b,
+        &dir.join("app.db"),
+        &[
+            ("NARI_PORT", &port2.to_string()),
+            ("NARI_PUBLIC_URL", &public),
+        ],
+    )
+    .expect("a second instance starts on the same database");
+    let r = call(second.port, Some(&again), "list_tasks", &json!({}), None).unwrap();
+    assert_eq!(
+        r.status, 200,
+        "sessions survive a switch to another instance"
+    );
+    assert_eq!(r.json()["data"]["items"].as_array().unwrap().len(), 1);
+    drop(second);
+
     for tamper in [
         Tamper::Audience,
         Tamper::Issuer,

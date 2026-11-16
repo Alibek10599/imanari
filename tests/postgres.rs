@@ -339,9 +339,29 @@ fn postgres_applies_additive_migrations_and_refuses_destructive_ones() {
         c.psql("migration", "SELECT steps FROM _nari_schema_history"),
         r#"["add field Task.notes"]"#
     );
-    let err = refused(b, &c.dir.join("old.db"), &url);
+    let (old, a1, _) = on(b, &c, &url);
+    assert_eq!(
+        items(old.port, &a1).len(),
+        2,
+        "the previous build runs against the expanded schema"
+    );
+    create(old.port, &a1, "from v1", "m3");
+    drop(old);
+    assert_eq!(
+        c.psql(
+            "migration",
+            "SELECT notes FROM \"entity_Task\" WHERE title = 'from v1'"
+        ),
+        "it's new"
+    );
+    let retyped = FIXTURE.replace(
+        "    field completed {",
+        "    field notes {\n      type = Int;\n      default = 0;\n    }\n\n    field completed {",
+    );
+    let b3 = build("pg-migration-v3", &retyped);
+    let err = refused(&b3, &c.dir.join("v3.db"), &url);
     assert!(err.contains("MIGRATION_REQUIRED"), "{err}");
-    assert!(err.contains("Task.notes was removed"), "{err}");
+    assert!(err.contains("type of Task.notes changed"), "{err}");
 
     let foreign = c.database("foreign");
     c.psql("foreign", "CREATE TABLE unrelated (id int)");

@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 pub const ADAPTER: &str = "docker";
 const RUN_IMAGE: &str = "gcr.io/distroless/cc-debian12:nonroot";
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
+const PROXY_IMAGE: &str = "nginx:1.30.6-alpine";
+const DRAIN: Duration = Duration::from_secs(5);
+const COLORS: [&str; 2] = ["blue", "green"];
 
 pub type Fail = (u8, &'static str, String);
 
@@ -60,6 +63,35 @@ fn run(mut cmd: Command, what: &str) -> Result<String, Fail> {
             3,
             "E_DOCKER",
             format!("docker {what} failed:\n{}", tail(&log, 30)),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn docker_input(args: &[&str], input: &str) -> Result<String, Fail> {
+    use std::io::Write;
+    let mut child = Command::new("docker")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| (3, "E_DOCKER_UNAVAILABLE", format!("cannot run docker: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| (3, "E_DOCKER", e.to_string()))?;
+    if !out.status.success() {
+        return Err((
+            3,
+            "E_DOCKER",
+            format!(
+                "docker {} failed: {}",
+                args.first().copied().unwrap_or_default(),
+                tail(&String::from_utf8_lossy(&out.stderr), 10)
+            ),
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -132,15 +164,101 @@ fn connectivity() -> Result<Json, Fail> {
 fn container(name: &str) -> Option<Json> {
     let out = docker(&["container", "inspect", "--format", "{{json .}}", name]).ok()?;
     let c: Json = serde_json::from_str(&out).ok()?;
-    Some(json!({ "id": c["Id"], "image": c["Image"] }))
+    Some(json!({ "id": c["Id"], "image": c["Image"], "running": c["State"]["Running"] }))
+}
+
+fn proxy_conf(name: &str, color: &str, port: u64) -> String {
+    format!(
+        "resolver 127.0.0.11 valid=5s ipv6=off;\n\
+         server {{\n\
+         \x20   listen {port};\n\
+         \x20   client_max_body_size 1m;\n\
+         \x20   location / {{\n\
+         \x20       set $nari_upstream http://{name}-{color}:{port};\n\
+         \x20       proxy_pass $nari_upstream;\n\
+         \x20       proxy_http_version 1.1;\n\
+         \x20       proxy_set_header Host $http_host;\n\
+         \x20       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
+         \x20       proxy_set_header X-Forwarded-Proto $scheme;\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+fn active_color(name: &str) -> Option<&'static str> {
+    let conf = docker(&[
+        "exec",
+        &format!("{name}-proxy"),
+        "cat",
+        "/etc/nginx/conf.d/default.conf",
+    ])
+    .ok()?;
+    COLORS
+        .into_iter()
+        .find(|c| conf.contains(&format!("http://{name}-{c}:")))
 }
 
 fn observe(name: &str, volume: Option<&str>) -> Json {
+    let proxy = container(&format!("{name}-proxy"));
+    let active = proxy
+        .as_ref()
+        .filter(|p| p["running"] == true)
+        .and_then(|_| active_color(name));
     json!({
-        "container": container(name),
-        "previous_container": exists(&["container", "inspect", &format!("{name}-prev")]),
+        "legacy_container": exists(&["container", "inspect", name]),
+        "network": exists(&["network", "inspect", name]),
         "volume": volume.map(|v| exists(&["volume", "inspect", v])),
+        "proxy": proxy,
+        "active": active,
+        "blue": container(&format!("{name}-blue")),
+        "green": container(&format!("{name}-green")),
     })
+}
+
+fn route(proxy: &str, conf: &str) -> Result<(), Fail> {
+    docker_input(
+        &[
+            "exec",
+            "-i",
+            proxy,
+            "sh",
+            "-c",
+            "cp /etc/nginx/conf.d/default.conf /tmp/nari-prev.conf && cat > /etc/nginx/conf.d/default.conf && if nginx -t 2>/tmp/nari-test; then nginx -s reload; else cp /tmp/nari-prev.conf /etc/nginx/conf.d/default.conf; cat /tmp/nari-test >&2; exit 1; fi",
+        ],
+        conf,
+    )
+    .map(|_| ())
+}
+
+fn probe(proxy: &str, host: &str, port: u64) -> Option<Json> {
+    let out = docker(&[
+        "exec",
+        proxy,
+        "wget",
+        "-q",
+        "-O",
+        "-",
+        "-T",
+        "5",
+        "--header",
+        &format!("Host: 127.0.0.1:{port}"),
+        &format!("http://{host}:{port}/_nari/health"),
+    ])
+    .ok()?;
+    serde_json::from_str(&out).ok()
+}
+
+fn serves(proxy: &str, host: &str, port: u64, expected: &str, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if probe(proxy, host, port).is_some_and(|h| h["source_sha256"] == expected) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn labels(image: &str) -> Json {
@@ -236,31 +354,35 @@ fn build_image(p: &Project, c: &Compiled, repo: &str) -> Result<Json, Fail> {
 fn schema_transition(c: &Compiled, deployed: &Json, postgres: bool) -> Result<Json, Fail> {
     let (_, fingerprint) = codegen::schema(&c.app);
     let from = deployed["nari.schema_fingerprint"].as_str();
-    let automatic: Vec<String> = match (from, deployed["nari.schema_shape"].as_str()) {
-        (Some(fp), _) if fp == fingerprint => Vec::new(),
-        (Some(_), Some(shape)) => {
-            let old: Vec<imanari_runtime::EntityShape> =
-                serde_json::from_str(shape).map_err(|e| {
-                    (
-                        4,
-                        "E_MIGRATION_BLOCKED",
-                        format!("deployed schema shape is unreadable: {e}"),
-                    )
-                })?;
-            let dialect = if postgres {
-                imanari_runtime::Dialect::Postgres
-            } else {
-                imanari_runtime::Dialect::Sqlite
-            };
-            imanari_runtime::migration_plan(&old, &codegen::schema_shape(&c.app), dialect)
-                .map_err(|blocked| (4, "E_MIGRATION_BLOCKED", blocked.join("; ")))?
-                .into_iter()
-                .map(|s| s.summary)
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    Ok(json!({ "from": from, "to": fingerprint, "automatic": automatic }))
+    let (automatic, behind): (Vec<String>, bool) =
+        match (from, deployed["nari.schema_shape"].as_str()) {
+            (Some(fp), _) if fp == fingerprint => (Vec::new(), false),
+            (Some(_), Some(shape)) => {
+                let old: Vec<imanari_runtime::EntityShape> =
+                    serde_json::from_str(shape).map_err(|e| {
+                        (
+                            4,
+                            "E_MIGRATION_BLOCKED",
+                            format!("deployed schema shape is unreadable: {e}"),
+                        )
+                    })?;
+                let new = codegen::schema_shape(&c.app);
+                let dialect = if postgres {
+                    imanari_runtime::Dialect::Postgres
+                } else {
+                    imanari_runtime::Dialect::Sqlite
+                };
+                match imanari_runtime::migration_plan(&old, &new, dialect) {
+                    Ok(steps) => (steps.into_iter().map(|s| s.summary).collect(), false),
+                    Err(_) if imanari_runtime::migration_plan(&new, &old, dialect).is_ok() => {
+                        (Vec::new(), true)
+                    }
+                    Err(blocked) => return Err((4, "E_MIGRATION_BLOCKED", blocked.join("; "))),
+                }
+            }
+            _ => (Vec::new(), false),
+        };
+    Ok(json!({ "from": from, "to": fingerprint, "automatic": automatic, "behind": behind }))
 }
 
 fn plans_dir(p: &Project) -> Result<PathBuf, Fail> {
@@ -357,28 +479,43 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
     let target = connectivity()?;
     let volume = o.database_url_env.is_none().then(|| format!("{name}-data"));
     let observed = observe(&name, volume.as_deref());
-    if observed["previous_container"] == true {
+    if observed["legacy_container"] == true {
         return Err((
             4,
-            "E_PREVIOUS_RELEASE_PENDING",
+            "E_LEGACY_DEPLOYMENT",
             format!(
-                "container {name}-prev from an unfinished release exists; inspect it, then remove or restore it before planning"
+                "container {name} was released without a proxy; remove it with `docker rm -f {name}` and plan again"
             ),
         ));
     }
-    let deployed = observed["container"]["image"]
+    let active = observed["active"]
         .as_str()
+        .or_else(|| COLORS.into_iter().find(|c| observed[*c]["running"] == true));
+    let color = if active == Some("blue") {
+        "green"
+    } else {
+        "blue"
+    };
+    let deployed = active
+        .and_then(|a| observed[a]["image"].as_str())
         .map(labels)
         .unwrap_or(Json::Null);
     let schema = schema_transition(c, &deployed, o.database_url_env.is_some())?;
     let repo = format!("nari-{}", c.app.name.to_lowercase().replace('_', "-"));
     let artifact = build_image(p, c, &repo)?;
-    let mut resources = vec![json!({
-        "kind": "image",
-        "ref": artifact["image"],
-        "digest": artifact["digest"],
-        "action": "use",
-    })];
+    let mut resources = vec![
+        json!({
+            "kind": "image",
+            "ref": artifact["image"],
+            "digest": artifact["digest"],
+            "action": "use",
+        }),
+        json!({
+            "kind": "network",
+            "name": name,
+            "action": if observed["network"] == true { "keep" } else { "create" },
+        }),
+    ];
     if let Some(v) = &volume {
         resources.push(json!({
             "kind": "volume",
@@ -404,15 +541,39 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
     };
     resources.push(json!({
         "kind": "container",
-        "name": name,
-        "action": if observed["container"].is_null() { "create" } else { "replace" },
+        "name": format!("{name}-{color}"),
+        "color": color,
+        "action": if observed[color].is_null() { "create" } else { "replace" },
         "image": artifact["digest"],
-        "publish": publish,
+        "network": name,
         "port": port,
         "restart": format!("on-failure:{}", c.app.recovery.max_restarts),
         "env": env,
         "secrets": secrets,
     }));
+    let proxy_ready = observed["proxy"]["running"] == true && observed["active"].is_string();
+    resources.push(json!({
+        "kind": "proxy",
+        "name": format!("{name}-proxy"),
+        "action": if observed["proxy"].is_null() {
+            "create"
+        } else if proxy_ready {
+            "keep"
+        } else {
+            "replace"
+        },
+        "image": PROXY_IMAGE,
+        "publish": publish,
+        "route": { "from": active, "to": color },
+    }));
+    if let Some(a) = active {
+        resources.push(json!({
+            "kind": "retire",
+            "name": format!("{name}-{a}"),
+            "action": "stop and remove",
+            "drain_seconds": DRAIN.as_secs(),
+        }));
+    }
     let database = match &o.database_url_env {
         Some(var) => json!({
             "engine": "postgresql",
@@ -421,9 +582,6 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
         }),
         None => json!({ "engine": "sqlite", "volume": volume }),
     };
-    let migrates = schema["automatic"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty());
     let plan = json!({
         "schema": "nari-plan/0.1",
         "adapter": ADAPTER,
@@ -454,14 +612,11 @@ pub fn plan(p: &Project, c: &Compiled, o: &PlanOptions) -> Result<Json, Fail> {
         "schema_transition": schema,
         "observed": observed,
         "readiness": {
-            "signal": "NARI_READY with the planned source_sha256 in the container log",
+            "signal": "NARI_READY with the planned source_sha256 in the container log, then /_nari/health from inside the network",
             "timeout_seconds": READY_TIMEOUT.as_secs(),
         },
-        "rollback": if migrates {
-            "the previous container stays stopped as <name>-prev, because this release migrates the schema"
-        } else {
-            "the previous container is restarted if the new one does not become ready"
-        },
+        "switch": "the proxy is reloaded to route to the new color only after it is ready; the old color keeps serving until then and drains afterwards",
+        "rollback": "if the new color is not ready, it is removed and traffic never moves (aborted); if it does not answer through the proxy after the switch, the proxy routes back to the old color (rolled_back)",
         "estimated_cost": {
             "monthly_usd": 0,
             "basis": "runs on an existing Docker engine and creates no metered cloud resources; host, storage and database costs are not included",
@@ -480,16 +635,12 @@ struct Ready {
     bootstrap: Option<String>,
 }
 
-fn wait_ready(name: &str, expected: Option<&str>, since: Option<i64>) -> Result<Ready, String> {
+fn wait_ready(name: &str, expected: &str) -> Result<Ready, String> {
     let deadline = Instant::now() + READY_TIMEOUT;
-    let since = since.map(|s| s.to_string());
     loop {
-        let mut args = vec!["logs"];
-        if let Some(s) = &since {
-            args.extend(["--since", s]);
-        }
-        args.push(name);
-        let out = docker_cmd(&args).output().map_err(|e| e.to_string())?;
+        let out = docker_cmd(&["logs", name])
+            .output()
+            .map_err(|e| e.to_string())?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let mut bootstrap = None;
         for line in stdout.lines() {
@@ -499,7 +650,7 @@ fn wait_ready(name: &str, expected: Option<&str>, since: Option<i64>) -> Result<
                 return Err(format!("app stopped during startup: {rest}"));
             } else if let Some(rest) = line.strip_prefix("NARI_READY ") {
                 let ready: Json = serde_json::from_str(rest).unwrap_or(Json::Null);
-                if expected.is_none_or(|e| ready["source_sha256"] == e) {
+                if ready["source_sha256"] == expected {
                     return Ok(Ready {
                         evidence: ready,
                         bootstrap,
@@ -582,13 +733,18 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
     let spec =
         find("container").ok_or_else(|| (4, "E_PLAN_TAMPERED", "plan has no container".into()))?;
     let volume = find("volume");
+    let base = find("network")
+        .and_then(|n| n["name"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let color = spec["color"].as_str().unwrap_or_default().to_string();
     let name = spec["name"].as_str().unwrap_or_default().to_string();
     let image = spec["image"].as_str().unwrap_or_default().to_string();
-    if !valid_name(&name) {
+    if !valid_name(&base) || !COLORS.contains(&color.as_str()) || name != format!("{base}-{color}")
+    {
         return Err((
             4,
             "E_PLAN_TAMPERED",
-            format!("invalid container name '{name}'"),
+            format!("invalid deployment '{base}' or container '{name}'"),
         ));
     }
     let present = docker(&["image", "inspect", "--format", "{{.Id}}", &image]).unwrap_or_default();
@@ -599,7 +755,7 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
             format!("image {image} is not on the Docker engine; run nari plan again"),
         ));
     }
-    let observed = observe(&name, volume.as_ref().and_then(|v| v["name"].as_str()));
+    let observed = observe(&base, volume.as_ref().and_then(|v| v["name"].as_str()));
     if observed != plan["observed"] {
         return Err((
             4,
@@ -628,37 +784,39 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
             }
         }
     }
+    let proxy = find("proxy").ok_or_else(|| (4, "E_PLAN_TAMPERED", "plan has no proxy".into()))?;
+    let network =
+        find("network").ok_or_else(|| (4, "E_PLAN_TAMPERED", "plan has no network".into()))?;
+    let retire = find("retire");
+    let text = |v: &Json| v.as_str().unwrap_or_default().to_string();
+    let (proxy_name, network_name) = (format!("{base}-proxy"), base.clone());
+    let port = spec["port"].as_u64().unwrap_or_default();
+    let expected = text(&plan["app"]["source_sha256"]);
     let release_id = crate::random_hex(8);
     let started_ms = now_ms();
+    let app_label = format!("nari.app={}", text(&plan["app"]["name"]));
+    if network["action"] == "create" {
+        docker(&["network", "create", "--label", &app_label, &network_name])?;
+    }
     if let Some(v) = &volume
         && v["action"] == "create"
     {
-        docker(&[
-            "volume",
-            "create",
-            "--label",
-            &format!(
-                "nari.app={}",
-                plan["app"]["name"].as_str().unwrap_or_default()
-            ),
-            v["name"].as_str().unwrap_or_default(),
-        ])?;
+        docker(&["volume", "create", "--label", &app_label, &text(&v["name"])])?;
     }
-    let previous = observed["container"].clone();
-    let prev_name = format!("{name}-prev");
-    if !previous.is_null() {
-        docker(&["stop", "-t", "15", &name])?;
-        docker(&["rename", &name, &prev_name])?;
+    if spec["action"] == "replace" {
+        docker(&["rm", "-f", &name])?;
     }
     let mut args: Vec<String> = [
         "run",
         "-d",
         "--name",
         &name,
+        "--network",
+        &network_name,
         "--restart",
         spec["restart"].as_str().unwrap_or("no"),
-        "-p",
-        spec["publish"].as_str().unwrap_or_default(),
+        "--label",
+        &app_label,
         "--label",
         &format!("nari.plan={hash}"),
         "--label",
@@ -668,16 +826,10 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
     .map(|s| s.to_string())
     .collect();
     for (key, value) in spec["env"].as_object().into_iter().flatten() {
-        args.extend([
-            "-e".into(),
-            format!("{key}={}", value.as_str().unwrap_or_default()),
-        ]);
+        args.extend(["-e".into(), format!("{key}={}", text(value))]);
     }
     if let Some(v) = &volume {
-        args.extend([
-            "-v".into(),
-            format!("{}:/data", v["name"].as_str().unwrap_or_default()),
-        ]);
+        args.extend(["-v".into(), format!("{}:/data", text(&v["name"]))]);
     }
     for (key, _) in &secrets {
         args.extend(["-e".into(), key.clone()]);
@@ -689,52 +841,76 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
         cmd.env(key, value);
     }
     let launched = run(cmd, "run");
-    let expected = plan["app"]["source_sha256"].as_str();
     let ready = match &launched {
-        Ok(_) => wait_ready(&name, expected, None),
+        Ok(_) => wait_ready(&name, &expected),
         Err((_, _, m)) => Err(m.clone()),
     };
     let container_id = launched.unwrap_or_default();
-    let (outcome, reason, evidence, bootstrap, log_tail) = match ready {
+    let previous = plan["observed"]["active"].clone();
+    let switched: Result<Ready, (String, bool)> = ready.map_err(|e| (e, false)).and_then(|r| {
+        if proxy["action"] == "keep" {
+            if !serves(&proxy_name, &name, port, &expected, Duration::from_secs(10)) {
+                return Err((
+                    format!("{name} did not answer /_nari/health inside the network"),
+                    false,
+                ));
+            }
+        } else {
+            let _ = docker(&["rm", "-f", &proxy_name]);
+            docker(&[
+                "run",
+                "-d",
+                "--name",
+                &proxy_name,
+                "--network",
+                &network_name,
+                "--restart",
+                "unless-stopped",
+                "-p",
+                &text(&proxy["publish"]),
+                "--label",
+                &app_label,
+                PROXY_IMAGE,
+            ])
+            .map_err(|(_, _, m)| (m, false))?;
+        }
+        route(&proxy_name, &proxy_conf(&base, &color, port)).map_err(|(_, _, m)| (m, false))?;
+        if serves(
+            &proxy_name,
+            "127.0.0.1",
+            port,
+            &expected,
+            Duration::from_secs(15),
+        ) {
+            Ok(r)
+        } else {
+            Err((
+                "the proxy did not reach the new color after the switch".into(),
+                true,
+            ))
+        }
+    });
+    let (outcome, reason, evidence, bootstrap, log_tail) = match switched {
         Ok(r) => {
-            if !previous.is_null() {
-                let _ = docker(&["rm", &prev_name]);
+            if let Some(old) = &retire {
+                std::thread::sleep(DRAIN);
+                let old = text(&old["name"]);
+                let _ = docker(&["stop", "-t", "15", &old]);
+                let _ = docker(&["rm", &old]);
             }
             ("released", None, r.evidence, r.bootstrap, String::new())
         }
-        Err(reason) => {
+        Err((reason, after_switch)) => {
             let logs = container_logs(&name);
-            let _ = docker(&["rm", "-f", &name]);
-            let migrates = plan["schema_transition"]["automatic"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty());
-            if previous.is_null() {
-                ("failed", Some(reason), Json::Null, None, logs)
-            } else if migrates {
-                (
-                    "stopped_needs_attention",
-                    Some(reason),
-                    Json::Null,
-                    None,
-                    logs,
-                )
-            } else {
-                let since = now_ms() / 1000 - 1;
-                let restored = docker(&["rename", &prev_name, &name])
-                    .and_then(|_| docker(&["start", &name]))
-                    .map_err(|(_, _, m)| m)
-                    .and_then(|_| wait_ready(&name, None, Some(since)));
-                match restored {
-                    Ok(r) => ("rolled_back", Some(reason), r.evidence, r.bootstrap, logs),
-                    Err(e) => (
-                        "rollback_failed",
-                        Some(format!("{reason}; rollback: {e}")),
-                        Json::Null,
-                        None,
-                        logs,
-                    ),
+            let outcome = match (after_switch, previous.as_str()) {
+                (false, Some(_)) => "aborted",
+                (true, Some(old)) if route(&proxy_name, &proxy_conf(&base, old, port)).is_ok() => {
+                    "rolled_back"
                 }
-            }
+                _ => "failed",
+            };
+            let _ = docker(&["rm", "-f", &name]);
+            (outcome, Some(reason), Json::Null, None, logs)
         }
     };
     let record = json!({
@@ -743,6 +919,7 @@ pub fn release(p: &Project, c: &Compiled, hash: &str) -> Result<Released, Fail> 
         "plan_sha256": hash,
         "adapter": ADAPTER,
         "name": name,
+        "color": color,
         "image": image,
         "container_id": container_id,
         "previous": previous,

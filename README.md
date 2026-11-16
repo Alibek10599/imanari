@@ -110,7 +110,16 @@ nari plan --port 8080                # builds the image, prints resources, schem
 nari release <plan hash>             # applies exactly that plan
 ```
 
-A plan names the image digest, the volume or the database secret reference, the container and its port, the restart policy derived from the `recovery` block, the schema migration the release will run, and a cost estimate with its basis and date. `nari release` refuses a plan whose file, source, image or target changed since it was written. It stops the running container, starts the new one, and waits for the app to report ready. If the new container fails, the previous one is restarted, unless the release migrated the schema; then it stays stopped as `<name>-prev` for you to inspect.
+Releases are blue-green. An nginx proxy (`<name>-proxy`, pinned `nginx:1.30.6-alpine`) owns the published port and routes over a private Docker network to `<name>-blue` or `<name>-green`. A plan names the image digest, the network, the volume or database secret reference, the new color with its restart policy (from the `recovery` block), the proxy route change, the color it retires, the schema migration, and a cost estimate with its basis and date.
+
+`nari release` refuses a plan whose file, source, image or target changed since it was written. It then:
+
+1. Starts the new color next to the running one, on the same database.
+2. Waits for the app to report ready, and checks `/_nari/health` from inside the network.
+3. Reloads the proxy to route to the new color, and confirms through the proxy that the new version answers.
+4. Lets the old color drain for five seconds, then stops it.
+
+If the new color never becomes ready, it is removed and traffic never moves (`aborted`). If it fails after the switch, the proxy routes back (`rolled_back`). Schema changes are additive, so the old color keeps working against the migrated database while both run. Sign-in sessions of `mode = oidc` apps are stored in the database and survive the switch.
 
 A `local_dev` app can only be planned as a preview: the container is published on the host's loopback interface. Production plans (`--production`) need `mode = oidc`, an https `--public-url`, and optionally `--oidc-secret-env VAR` and `--publish-address`; terminate TLS for the public URL in front of the container. With `--database-url-env VAR`, the container uses PostgreSQL and reads the URL from `VAR` at release time. The value never reaches the plan or the release record, but Docker keeps container environment in its own configuration.
 
@@ -185,7 +194,7 @@ Unsupported in 0.1, each rejected with a diagnostic:
 - Mobile targets, identity providers other than OpenID Connect, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.
 - Public or anonymous access, list filters, and floats or other types beyond Text, Bool, UUID and Int.
-- `automatic_release = true`, production deployment plans, and staged (canary) releases.
+- `automatic_release = true`, and canary releases that split traffic between versions.
 - Live LLM proposers.
 
 ## Limits and non-claims
