@@ -360,10 +360,24 @@ fn schema_changes_are_planned_as_automatic_or_blocked() {
     assert!(imanari::diff::render(&d).contains("applied automatically on the next start"));
 
     let back = imanari::diff::diff(&compiled(&with_notes), &base);
-    assert_eq!(back["migration_required"], true);
+    assert_eq!(back["migration_required"], false);
+    assert_eq!(back["migration"]["blocked"], json!([]));
     assert_eq!(
-        back["migration"]["blocked"],
-        json!(["field Task.notes was removed, which would drop its stored values"])
+        back["migration"]["database_ahead_by"],
+        json!(["add field Task.notes"])
+    );
+    assert!(imanari::diff::render(&back).contains("stay ahead of this build"));
+    let retyped = FIXTURE.replace(
+        "    field completed {",
+        "    field notes {\n      type = Int;\n      default = 0;\n    }\n\n    field completed {",
+    );
+    let d = imanari::diff::diff(&compiled(&with_notes), &compiled(&retyped));
+    assert_eq!(d["migration_required"], true);
+    assert_eq!(
+        d["migration"]["blocked"],
+        json!([
+            "type of Task.notes changed from Text 0..4096 to Int, which stored values may not satisfy"
+        ])
     );
 
     let field_title =
@@ -376,12 +390,10 @@ fn schema_changes_are_planned_as_automatic_or_blocked() {
     );
     let narrowed = FIXTURE.replacen(field_title, &field_title.replace("200", "100"), 1);
     let d = imanari::diff::diff(&base, &compiled(&narrowed));
-    assert_eq!(d["migration_required"], true);
-    assert!(
-        d["migration"]["blocked"][0]
-            .as_str()
-            .unwrap()
-            .contains("Task.title")
+    assert_eq!(d["migration_required"], false);
+    assert_eq!(
+        d["migration"]["database_ahead_by"],
+        json!(["widen Task.title from Text 1..100 to Text 1..200"])
     );
 
     let old = imanari::codegen::schema_shape(&base.app);

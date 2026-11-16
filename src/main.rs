@@ -550,11 +550,18 @@ fn plan(p: &Project, o: &imanari::deploy::PlanOptions) -> CmdResult {
                 res["digest"].as_str().unwrap_or_default()
             ),
             Some("container") => format!(
-                "{} {}, {}, restart {}",
+                "{} {}, restart {}",
+                res["name"].as_str().unwrap_or_default(),
+                res["action"].as_str().unwrap_or_default(),
+                res["restart"].as_str().unwrap_or_default()
+            ),
+            Some("proxy") => format!(
+                "{} {}, {}, route {} -> {}",
                 res["name"].as_str().unwrap_or_default(),
                 res["action"].as_str().unwrap_or_default(),
                 res["publish"].as_str().unwrap_or_default(),
-                res["restart"].as_str().unwrap_or_default()
+                res["route"]["from"].as_str().unwrap_or("none"),
+                res["route"]["to"].as_str().unwrap_or_default()
             ),
             _ => format!(
                 "{} {}",
