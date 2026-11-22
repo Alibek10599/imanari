@@ -1,6 +1,6 @@
 # Imanari: system language and adaptive runtime
 
-Version: 0.1-draft. Date: 2026-11-02. Status: draft specification. 0.1 is implemented in this repository as a developer preview.
+Version: 0.1-draft. Date: 2026-11-23. Status: draft specification. 0.1 and the production-web release (tool version 0.3) are implemented in this repository as a developer preview.
 
 ## 1. Product contract
 
@@ -28,7 +28,7 @@ The reference application is Fieldwork: two users can create, list, and complete
 
 ### Subsequent releases
 
-1. Production web: real identity adapter, PostgreSQL, migration compatibility, a single deployment adapter, telemetry and staged releases.
+1. Production web: real identity adapter, PostgreSQL, migration compatibility, a single deployment adapter, telemetry and staged releases. Delivered in tool version 0.3 (D16–D21 in [decisions](decisions.md)).
 2. Mobile: generated SwiftUI and Kotlin Compose views, shared generated API contracts, native extension boundaries, compatibility with older clients, and explicit offline policies.
 3. Extended language: typed business expressions and trusted native extensions, then durable workflows and external adapters.
 4. Adaptive operations: canary deployment, external operational repair, evidence-based recovery selection, and narrowly scoped automatic repair releases.
@@ -103,7 +103,7 @@ Generate loading, empty, error, and success states; prevent double submission wh
 
 ### 5.4 Runtime and policy declarations
 
-`identity NAME { mode = local_dev; }` is the 0.1 identity mode. The production-web release adds `mode = oidc` with `issuer` and `client_id` ([D20](decisions.md)). `runtime` properties are `bind` (must be 127.0.0.1), `port` (1024..65535), `database` (relative path under `.nari/`), `request_limit_bytes` (1..65536), and `request_timeout_ms` (100..30000). Reject symlink or traversal escapes for generated files and database paths. Persistent files use restrictive permissions where supported.
+`identity NAME { mode = local_dev; }` is the 0.1 identity mode. The production-web release adds `mode = oidc` with `issuer` and `client_id` ([D20](decisions.md)). `runtime` properties are `bind` (must be 127.0.0.1), `port` (1024..65535), `database` (relative path under `.nari/`), `request_limit_bytes` (1..65536), and `request_timeout_ms` (100..30000). A deployment may override the bind address with `NARI_BIND` and store data in PostgreSQL through `NARI_DATABASE_URL` (D18, D19). Reject symlink or traversal escapes for generated files and database paths. Persistent files use restrictive permissions where supported.
 
 `recovery` declares `target = backend`, `max_restarts`, `window_seconds`, `backoff_ms`, and `after_exhaustion = stop`. Bounds: restarts 0..10, window 1..3600 seconds, backoffs 0..60000 ms. Array length must equal max_restarts. Restart budgets are persisted and cannot reset merely by restarting the supervisor.
 
@@ -129,7 +129,7 @@ Development identity is explicitly local-only. Seed two stable user UUIDs. Gener
 
 Bind only to loopback, validate Host and Origin, reject cross-origin state changes, and protect cookie-authenticated mutations with a CSRF token. Omitted Origin is permitted only for explicit authenticated CLI/test requests with the required anti-CSRF header. The production planner must reject `local_dev` entirely. Use a strict CSP, no inline executable scripts, and no permissive CORS. Authenticated responses and bootstrap responses use `Cache-Control: no-store`.
 
-This is a local development convenience, not protection from a hostile user or malware on the same host. Production authentication is a separate release gate using a maintained provider/library, not a homegrown password implementation.
+This is a local development convenience, not protection from a hostile user or malware on the same host. Production authentication is `mode = oidc`: OpenID Connect through a maintained library, not a homegrown password implementation (D20).
 
 ### Request and data semantics
 
@@ -139,7 +139,7 @@ Error mapping: malformed/invalid input→400; missing or invalid session→401; 
 
 Generate parameterized SQL. Author identifiers must pass lexical validation and still be quoted by the backend adapter. Ownership filters must appear inside the actual select/update predicate; client filtering is insufficient. Updates atomically check id, owner, and expected_revision, then increment revision; overflow is an error. Use transactions to combine the operation, revision change, and successful idempotency receipt.
 
-On first startup, initialize a new database and store its schema fingerprint and schema shape. When the compiled schema differs from the stored one, the runtime applies only additive changes, automatically and in one transaction before serving: new entities, new fields that declare a default, and widened text bounds. Each applied migration is recorded in `_nari_schema_history`. Any other difference (a removed entity or field, a changed owner field or type, narrowed bounds, or a new field without a default) must stop startup with `MIGRATION_REQUIRED` and name the change; do not drop, recreate, or silently reinterpret stored data. A database without a stored shape only accepts an identical fingerprint. Non-schema application changes may reuse the database. A developer can explicitly choose a different database path for experiments. Migrations that remove, rename or rewrite stored data belong to the production-web milestone and need separate authority.
+On first startup, initialize a new database and store its schema fingerprint and schema shape. When the compiled schema differs from the stored one, the runtime applies only additive changes, automatically and in one transaction before serving: new entities, new fields that declare a default, and widened text bounds. Each applied migration is recorded in `_nari_schema_history`. Any other difference (a removed entity or field, a changed owner field or type, narrowed bounds, or a new field without a default) must stop startup with `MIGRATION_REQUIRED` and name the change; do not drop, recreate, or silently reinterpret stored data. A database without a stored shape only accepts an identical fingerprint. Non-schema application changes may reuse the database. A developer can explicitly choose a different database path for experiments. An older build may start against a stored schema that only adds to its own, so two versions can share a database during a release (D21). Migrations that remove, rename or rewrite stored data are not supported yet and need separate authority.
 
 Idempotency receipts are scoped to actor, action, and key, with a hash of validated canonical input and a stored response. Repeated identical requests return the committed response; different input with the same key returns 409. Concurrent duplicates must converge through a uniqueness constraint and transaction handling. A committed operation followed by a lost HTTP response must not duplicate data on retry. Keep receipts for the life of the 0.1 development database; bounded retention is a later explicit compatibility policy. Failed transactions do not store success receipts.
 
@@ -210,7 +210,7 @@ Initially, learning is retrieval and outcome accounting. Exact compatible failur
 
 ## 10. DevOps, mobile, and later extension requirements
 
-These are roadmap contracts, not 0.1 implementation requirements:
+These are roadmap contracts, not 0.1 implementation requirements. Version 0.3 implements the first three for one Docker deployment adapter, with blue-green releases instead of canary promotion (D19, D21):
 
 - Production plans must show concrete resources, authentication mode, secret references, connectivity, schema transitions, artifact digests, and estimated costs with the basis/date of estimates. Apply exactly a reviewed plan with drift checks. Reject development identity or unknown required adapters.
 - Releases use immutable artifacts and readiness gates. Canary promotion requires a declared observation window, minimum evidence volume, correct-behavior checks, and comparison against baseline, not only fewer errors. Missing evidence prevents promotion.
@@ -240,8 +240,10 @@ All commands accept `--project PATH` and `--json`; default project is the curren
 | `nari repair ID --proposer fixture` | Run isolated repair pipeline, never release |
 | `nari apply-repair ID --candidate HASH` | Explicitly apply validated local candidate after rechecks |
 | `nari bench` | Reproducible compiler/runtime/context benchmark report |
+| `nari plan [--production]` | Build the app image and write a reviewable, hash-named deployment plan |
+| `nari release PLAN` | Apply exactly that plan after drift checks, blue-green behind a proxy |
 
-`plan`, `release`, and mobile build targets return explicit unsupported-feature errors until their milestones exist. `nari check` remains offline after installing the CLI. `build` may need dependency installation initially, and must report that distinctly from source validation failure.
+Mobile build targets return explicit unsupported-feature errors until their milestone exists. `plan` needs Docker; a production plan also needs `mode = oidc` and an https public URL. `nari check` remains offline after installing the CLI. `build` may need dependency installation initially, and must report that distinctly from source validation failure.
 
 Behavior diff reports added/removed capabilities, input/output changes, access changes, data migrations (split into changes applied automatically and changes that block startup), affected consumers, runtime changes, and recovery/repair authority changes. Any unclassified semantic difference is shown as unknown and triggers full validation; do not call it harmless.
 

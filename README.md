@@ -183,13 +183,14 @@ The suites build generated apps into `target/nari-apps` and run real HTTP agains
 Implemented:
 
 - The 0.1 grammar and schema, typed IR and graph, formatter, and diagnostics.
-- Rust and web generation with SQLite persistence.
-- Local development identity with CSRF, Origin and Host checks, idempotency receipts, and revision checks.
+- Rust and web generation with SQLite or PostgreSQL persistence, and additive schema migrations on startup.
+- Local development identity and OpenID Connect sign-in, with CSRF, Origin and Host checks, idempotency receipts, and revision checks.
+- Request telemetry, and Docker deployments from reviewed plans with blue-green releases.
 - Supervisor with persisted budgets and reconciliation, and incident records.
 - Context bundles, behavior diff, and stale-patch rejection.
 - The isolated repair pipeline with explicit apply, and the benchmark harness.
 
-Unsupported in 0.1, each rejected with a diagnostic:
+Unsupported so far, each rejected with a diagnostic:
 
 - Mobile targets, identity providers other than OpenID Connect, and migrations that remove, rename or retype stored data.
 - Workflows, external effects and adapters, native extensions, and policy expressions.

@@ -4,6 +4,8 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
 ### Added
 
 - Additive schema migrations. When an app starts against a database built from an older schema, new entities, new fields with a default, and widened text bounds are applied in one transaction and recorded in `_nari_schema_history`. Changes that would drop or reinterpret stored data still stop startup with `MIGRATION_REQUIRED`, and the message now names each change.
@@ -41,6 +43,7 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 - Prebuilt `frame` binaries for macOS (Apple silicon) and Linux (x86_64 and arm64). The CLI bundles `frame-runtime`, so generated apps do not need a source checkout.
 - CLI commands: `init`, `fmt`, `check`, `build`, `dev`, `test`, `context`, `diff`, `status`, `incidents`, `repair`, `apply-repair` and `bench`. `plan` and `release` fail as unsupported.
 
-[Unreleased]: https://github.com/Alibek10599/imanari/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Alibek10599/imanari/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Alibek10599/imanari/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Alibek10599/imanari/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Alibek10599/imanari/releases/tag/v0.1.0

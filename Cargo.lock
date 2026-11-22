@@ -693,7 +693,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "fieldwork-baseline"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "imanari-runtime",
  "serde",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "imanari"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "getrandom 0.3.4",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "imanari-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
