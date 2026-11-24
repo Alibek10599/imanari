@@ -1,0 +1,9 @@
+{
+  "name": "a greeting is saved for its author only",
+  "covers": ["hello/action/say", "hello/action/greetings"],
+  "steps": [
+    { "as": "a", "action": "say", "input": { "text": "Hello, world" }, "expect": { "status": 200, "data": { "text": "Hello, world" } } },
+    { "as": "a", "action": "greetings", "input": {}, "expect": { "status": 200 } },
+    { "as": "b", "action": "say", "input": { "text": "" }, "expect": { "status": 400 } }
+  ]
+}

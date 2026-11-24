@@ -2,6 +2,8 @@
 
 Imanari is a small, human-readable system language. A `.nari` file declares data, owner-scoped actions, screens, runtime limits, recovery policy, and repair authority. The compiler turns it into a native Rust backend (Axum + SQLx on SQLite or PostgreSQL), a browser UI built from native controls, a typed IR, and a dependency graph. Agents work from bounded, versioned context bundles instead of reconstructing the project from chat history.
 
+New to the language? Start with [the guide](docs/guide.md), which builds a hello-world app and explains every block. Its [web version](https://alibek10599.github.io/imanari-website/guide.html) has playgrounds you can edit in the browser.
+
 Imanari 0.1 is a developer preview. [docs/spec.md](docs/spec.md) is the normative contract and [examples/fieldwork](examples/fieldwork) the reference app. [docs/progress.md](docs/progress.md) maps every acceptance item to its evidence, and [docs/decisions.md](docs/decisions.md) records spec clarifications.
 
 This is a local vertical slice. It is not a production platform, and it makes no universal security or C++-parity claims (see [Non-claims](#limits-and-non-claims)).
@@ -174,8 +176,8 @@ The suites build generated apps into `target/nari-apps` and run real HTTP agains
 | `src/supervisor.rs` | Supervisor, control DB, restart budget, reconciliation, and incidents |
 | `src/repair.rs`, `src/sandbox.rs` | Repair state machine, fixture proposer, Seatbelt sandbox, and precedents |
 | `src/bench.rs`, `bench/baseline/` | Benchmark harness and the hand-written baseline backend |
-| `examples/fieldwork/` | Reference app and its protected acceptance tests |
-| `docs/` | Specification, decision records and the progress report |
+| `examples/fieldwork/`, `examples/hello/` | Reference app and the guide's hello-world app, each with protected acceptance tests |
+| `docs/` | Language guide, specification, decision records and the progress report |
 | `tests/` | Integration suites; `scripts/collect-evidence.sh` exports acceptance evidence |
 
 ## Implemented and unsupported
