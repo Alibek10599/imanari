@@ -4,6 +4,10 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+### Added
+
+- A language guide, `docs/guide.md`, and a hello-world example in `examples/hello`.
+
 ## [0.3.0] - 2026-11-23
 
 ### Added

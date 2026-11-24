@@ -583,3 +583,15 @@ fn init_creates_a_checked_project_and_never_overwrites() {
     assert_eq!(again.status.code(), Some(3));
     assert_eq!(run(&["init", "Bad-Name"]).status.code(), Some(2));
 }
+
+#[test]
+fn hello_example_compiles_and_is_formatted() {
+    let src = include_str!("../examples/hello/hello.nari");
+    let (c, warnings) = compile(src, "hello.nari").expect("hello compiles");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(c.app.name, "hello");
+    assert_eq!(
+        format_source(src, "hello.nari").expect("hello formats"),
+        src
+    );
+}

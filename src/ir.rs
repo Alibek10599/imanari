@@ -1,6 +1,6 @@
 use crate::diag::Span;
 use serde::Serialize;
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -446,4 +446,70 @@ impl Compiled {
             },
         })
     }
+}
+
+fn type_json(t: &Type) -> Json {
+    match t {
+        Type::Text {
+            min_length,
+            max_length,
+        } => json!({ "name": "Text", "min_length": min_length, "max_length": max_length }),
+        other => json!({ "name": other.base() }),
+    }
+}
+
+pub fn web_config(app: &App, source_sha256: &str) -> Json {
+    let screens: Vec<Json> = app
+        .screens
+        .iter()
+        .map(|s| {
+            let query = app.action(&s.query).expect("validated query");
+            let ent = app.action_entity(query);
+            let forms: Vec<Json> = s
+                .forms
+                .iter()
+                .map(|f| {
+                    let action = app.action(&f.submit).expect("validated submit");
+                    let inputs: Vec<Json> = f
+                        .inputs
+                        .iter()
+                        .map(|i| {
+                            let ty = &action.input(&i.name).expect("validated control").ty;
+                            json!({ "name": i.name, "label": i.label, "placeholder": i.placeholder, "type": type_json(ty) })
+                        })
+                        .collect();
+                    json!({ "name": f.name, "submit": f.submit, "inputs": inputs })
+                })
+                .collect();
+            let lists: Vec<Json> = s
+                .lists
+                .iter()
+                .map(|l| {
+                    let fields: Vec<Json> = l
+                        .fields
+                        .iter()
+                        .map(|f| json!({ "name": f, "type": type_json(&ent.any_field(f).expect("validated field").ty) }))
+                        .collect();
+                    let buttons: Vec<Json> = l
+                        .buttons
+                        .iter()
+                        .map(|b| {
+                            let args: Vec<Json> = b
+                                .arguments
+                                .iter()
+                                .map(|a| match &a.binding {
+                                    ArgBinding::Item { field } => json!({ "input": a.input, "from": "item", "field": field }),
+                                    ArgBinding::Literal { value } => json!({ "input": a.input, "from": "literal", "value": value.to_json() }),
+                                })
+                                .collect();
+                            json!({ "name": b.name, "label": b.label, "action": b.action, "arguments": args })
+                        })
+                        .collect();
+                    json!({ "name": l.name, "fields": fields, "buttons": buttons })
+                })
+                .collect();
+            json!({ "route": s.route, "title": s.title, "query": s.query, "entity": ent.name, "forms": forms, "lists": lists })
+        })
+        .collect();
+    json!({ "app": app.name, "identity": app.identity.mode, "source_sha256": source_sha256, "screens": screens })
 }
