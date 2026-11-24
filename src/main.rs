@@ -18,7 +18,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Project directory or .nari file (default: current directory)"
+        help = "Project directory or .nr file (default: current directory)"
     )]
     project: Option<PathBuf>,
     #[arg(long, global = true, help = "Machine-readable JSON output")]
@@ -292,12 +292,12 @@ fn init(dir: Option<PathBuf>, name: &str) -> CmdResult {
             format!("{} already exists; init never overwrites", root.display()),
         ));
     }
-    let template = include_str!("../examples/fieldwork/fieldwork.nari").replacen(
+    let template = include_str!("../examples/fieldwork/fieldwork.nr").replacen(
         "app fieldwork {",
         &format!("app {name} {{"),
         1,
     );
-    let file = format!("{name}.nari");
+    let file = format!("{name}.nr");
     imanari::compile(&template, &file).map_err(Failure::diags)?;
     fs::create_dir_all(&root).map_err(|e| Failure::new(3, "E_IO", e.to_string()))?;
     fs::write(root.join(&file), template).map_err(|e| Failure::new(3, "E_IO", e.to_string()))?;

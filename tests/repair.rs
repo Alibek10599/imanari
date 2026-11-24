@@ -68,7 +68,7 @@ fn details(v: &Value) -> Value {
 )]
 fn seeded_bug_is_repaired_in_isolation_and_applied_only_explicitly() {
     let (dir, inc) = seeded("repair-success");
-    let src_file = dir.join("fieldwork.nari");
+    let src_file = dir.join("fieldwork.nr");
     let before = sha(&src_file);
     let (code, report, err) = nari(&dir, &[], &["repair", &inc, "--proposer", "fixture"]);
     assert_eq!(code, 0, "{err}\n{report}");
@@ -101,12 +101,9 @@ fn seeded_bug_is_repaired_in_isolation_and_applied_only_explicitly() {
     )
     .unwrap();
     assert_eq!(task.state, "validated");
-    let c = imanari::compile(
-        &std::fs::read_to_string(&src_file).unwrap(),
-        "fieldwork.nari",
-    )
-    .unwrap()
-    .0;
+    let c = imanari::compile(&std::fs::read_to_string(&src_file).unwrap(), "fieldwork.nr")
+        .unwrap()
+        .0;
     assert!(
         task.verify(&dir, &c.source_sha256, &c.graph_sha256)
             .is_empty(),
@@ -156,7 +153,7 @@ fn seeded_bug_is_repaired_in_isolation_and_applied_only_explicitly() {
 )]
 fn malicious_out_of_scope_and_stale_proposals_are_rejected() {
     let src = FIXTURE.replace(BUGGY_FROM, BUGGY_TO);
-    let c = imanari::compile(&src, "fieldwork.nari").unwrap().0;
+    let c = imanari::compile(&src, "fieldwork.nr").unwrap().0;
     let mk = |file: &str, from: &str, to: &str| {
         let start = src.find(from).unwrap();
         Patch {
@@ -175,11 +172,11 @@ fn malicious_out_of_scope_and_stale_proposals_are_rejected() {
         }
     };
     let code = |p: &Patch| {
-        imanari::repair::validate_static(&c, &src, "fieldwork.nari", p)
+        imanari::repair::validate_static(&c, &src, "fieldwork.nr", p)
             .err()
             .map(|r| r.code)
     };
-    let f = "fieldwork.nari";
+    let f = "fieldwork.nr";
     assert_eq!(
         code(&mk(f, BUGGY_TO, "set = { completed: true };")),
         None,
@@ -246,7 +243,7 @@ fn malicious_out_of_scope_and_stale_proposals_are_rejected() {
         "protected tests"
     );
     assert_eq!(
-        code(&mk("../outside.nari", BUGGY_TO, "x")),
+        code(&mk("../outside.nr", BUGGY_TO, "x")),
         Some("PATCH_PATH_FORBIDDEN"),
         "path outside project"
     );
@@ -272,7 +269,7 @@ fn malicious_out_of_scope_and_stale_proposals_are_rejected() {
     );
     let evil_path = dir.join("evil.json");
     std::fs::write(&evil_path, serde_json::to_vec(&evil).unwrap()).unwrap();
-    let before = sha(&dir.join("fieldwork.nari"));
+    let before = sha(&dir.join("fieldwork.nr"));
     let (code, out, _) = nari(
         &dir,
         &[],
@@ -287,7 +284,7 @@ fn malicious_out_of_scope_and_stale_proposals_are_rejected() {
     let report = details(&out);
     assert_eq!(report["state"], "Rejected");
     assert_eq!(report["static_validation"]["code"], "PATCH_SCOPE_VIOLATION");
-    assert_eq!(sha(&dir.join("fieldwork.nari")), before);
+    assert_eq!(sha(&dir.join("fieldwork.nr")), before);
 
     let (code, out, _) = nari(&dir, &[], &["repair", &inc, "--proposer", "fixture"]);
     assert_eq!(code, 0, "second attempt within max_attempts = 2: {out}");
@@ -348,7 +345,7 @@ fn precedents_require_compatible_versions() {
     let (code, out, _) = nari(&dir, &[], &["repair", &inc, "--proposer", "fixture"]);
     assert_eq!(code, 0, "{out}");
     let p = imanari::Project::locate(Some(dir.clone())).unwrap();
-    let c = imanari::compile(&std::fs::read_to_string(&p.file).unwrap(), "fieldwork.nari")
+    let c = imanari::compile(&std::fs::read_to_string(&p.file).unwrap(), "fieldwork.nr")
         .unwrap()
         .0;
     let sig = "test:acceptance/complete_task.json:step1:data.completed";

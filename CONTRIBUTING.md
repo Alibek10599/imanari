@@ -4,7 +4,7 @@ Thanks for taking the time to help. Imanari is a 0.1 developer preview, so the l
 
 ## Before you start
 
-- For bugs, open an issue with the `.nari` source (or the smallest part that reproduces it), the command you ran, and the full diagnostic or JSON output.
+- For bugs, open an issue with the `.nr` source (or the smallest part that reproduces it), the command you ran, and the full diagnostic or JSON output.
 - For language or runtime changes, open an issue first. [docs/spec.md](docs/spec.md) is the normative contract, so a change that alters accepted syntax, generated behavior, or a security property needs a decision record in [docs/decisions.md](docs/decisions.md) that states its acceptance impact.
 - Unsupported features must keep failing with an explicit diagnostic. Please don't add placeholder behavior that silently does something else.
 

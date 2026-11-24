@@ -4,6 +4,10 @@ All notable changes to Imanari are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+### Changed
+
+- Source files now use the `.nr` extension instead of `.nari`. Rename existing sources; the `nari` command and the `.nari/` build directory keep their names.
+
 ### Added
 
 - A language guide, `docs/guide.md`, and a hello-world example in `examples/hello`.

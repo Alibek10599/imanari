@@ -14,7 +14,7 @@ mkdir -p "$OUT"/{context,diff,recovery,repair,bench}
 project() {
   rm -rf "$WORK/$1"
   mkdir -p "$WORK/$1"
-  cp "$ROOT/examples/fieldwork/fieldwork.nari" "$WORK/$1/"
+  cp "$ROOT/examples/fieldwork/fieldwork.nr" "$WORK/$1/"
   cp -R "$ROOT/examples/fieldwork/acceptance" "$WORK/$1/"
   echo "$WORK/$1"
 }
@@ -41,11 +41,11 @@ cp "$P/.nari/graph.json" "$OUT/graph.json"
 cp "$P/.nari/manifest.json" "$OUT/artifact-manifest.json"
 
 D1="$(project diff-bound)"
-perl -0pi -e 's/(input title \{\n      type = Text;\n      min_length = 1;\n      max_length = )200/${1}100/' "$D1/fieldwork.nari"
+perl -0pi -e 's/(input title \{\n      type = Text;\n      min_length = 1;\n      max_length = )200/${1}100/' "$D1/fieldwork.nr"
 "$NARI" --project "$D1" diff --base "$P" >"$OUT/diff/input-bound.txt"
 "$NARI" --json --project "$D1" diff --base "$P" >"$OUT/diff/input-bound.json"
 D2="$(project diff-owner)"
-perl -0pi -e 's/owner_field = owner;/owner_field = assignee;/; s/field owner \{/field assignee {/; s/owner: \@actor.id,/assignee: \@actor.id,/' "$D2/fieldwork.nari"
+perl -0pi -e 's/owner_field = owner;/owner_field = assignee;/; s/field owner \{/field assignee {/; s/owner: \@actor.id,/assignee: \@actor.id,/' "$D2/fieldwork.nr"
 "$NARI" --project "$D2" diff --base "$P" >"$OUT/diff/owner-policy.txt"
 "$NARI" --json --project "$D2" diff --base "$P" >"$OUT/diff/owner-policy.json"
 
@@ -58,29 +58,29 @@ capture "$OUT/recovery/acknowledged-still-exhausted.txt" env NARI_PORT=0 NARI_FA
 "$NARI" --json --project "$R" status >"$OUT/recovery/status-after-acknowledge.json"
 
 S="$(project seeded)"
-perl -pi -e 's/set = \{ completed: true \};/set = { completed: false };/' "$S/fieldwork.nari"
+perl -pi -e 's/set = \{ completed: true \};/set = { completed: false };/' "$S/fieldwork.nr"
 capture "$OUT/repair/01-test-catches-seeded-bug.txt" "$NARI" --project "$S" test
 INC="$("$NARI" --json --project "$S" incidents | perl -MJSON::PP -e 'local $/; print decode_json(<STDIN>)->{incidents}[0]{incident_id}')"
 cat >"$WORK/evil.json" <<EOF
-{"schema":"nari-patch/0.1","base_source_sha256":"$(shasum -a 256 "$S/fieldwork.nari" | cut -d' ' -f1)","base_graph_sha256":"","affected_nodes":["fieldwork/action/complete_task"],"allowed_scope":["fieldwork/action/complete_task"],"edits":[{"file":"acceptance/complete_task.json","start":0,"end":1,"replacement":"{"}],"rationale":"tries to edit a protected test"}
+{"schema":"nari-patch/0.1","base_source_sha256":"$(shasum -a 256 "$S/fieldwork.nr" | cut -d' ' -f1)","base_graph_sha256":"","affected_nodes":["fieldwork/action/complete_task"],"allowed_scope":["fieldwork/action/complete_task"],"edits":[{"file":"acceptance/complete_task.json","start":0,"end":1,"replacement":"{"}],"rationale":"tries to edit a protected test"}
 EOF
 capture "$OUT/repair/02-malicious-proposal-rejected.txt" "$NARI" --project "$S" repair "$INC" --proposer "file:$WORK/evil.json"
-SHA_BEFORE="$(shasum -a 256 "$S/fieldwork.nari")"
+SHA_BEFORE="$(shasum -a 256 "$S/fieldwork.nr")"
 "$NARI" --json --project "$S" repair "$INC" --proposer fixture >"$OUT/repair/03-validated-report.json"
-SHA_AFTER="$(shasum -a 256 "$S/fieldwork.nari")"
+SHA_AFTER="$(shasum -a 256 "$S/fieldwork.nr")"
 printf 'before repair: %s\nafter repair:  %s\n' "$SHA_BEFORE" "$SHA_AFTER" >"$OUT/repair/04-running-source-untouched.txt"
 HASH="$(perl -MJSON::PP -e 'local $/; print decode_json(<STDIN>)->{proposal}{candidate_hash}' <"$OUT/repair/03-validated-report.json")"
 cp "$S/.nari/repair/$INC/candidates/$HASH.json" "$OUT/repair/candidate.json"
 LAST_ATTEMPT="$(ls -d "$S/.nari/repair/$INC"/attempt-* | sort -V | tail -1)"
 cp "$LAST_ATTEMPT/task.json" "$OUT/repair/task-record.json"
-cp "$S/fieldwork.nari" "$WORK/seeded.nari"
-printf '// unrelated edit\n' | cat - "$WORK/seeded.nari" >"$S/fieldwork.nari"
+cp "$S/fieldwork.nr" "$WORK/seeded.nr"
+printf '// unrelated edit\n' | cat - "$WORK/seeded.nr" >"$S/fieldwork.nr"
 capture "$OUT/repair/05-stale-candidate-rejected.txt" "$NARI" --project "$S" apply-repair "$INC" --candidate "$HASH"
-cp "$WORK/seeded.nari" "$S/fieldwork.nari"
+cp "$WORK/seeded.nr" "$S/fieldwork.nr"
 capture "$OUT/repair/06-explicit-apply.txt" "$NARI" --project "$S" apply-repair "$INC" --candidate "$HASH"
 capture "$OUT/repair/07-tests-after-apply.txt" "$NARI" --project "$S" test
 S2="$(project nosandbox)"
-perl -pi -e 's/set = \{ completed: true \};/set = { completed: false };/' "$S2/fieldwork.nari"
+perl -pi -e 's/set = \{ completed: true \};/set = { completed: false };/' "$S2/fieldwork.nr"
 "$NARI" --project "$S2" test >/dev/null 2>&1 || true
 INC2="$("$NARI" --json --project "$S2" incidents | perl -MJSON::PP -e 'local $/; print decode_json(<STDIN>)->{incidents}[0]{incident_id}')"
 capture "$OUT/repair/08-sandbox-unavailable.txt" env NARI_SANDBOX=none "$NARI" --project "$S2" repair "$INC2" --proposer fixture

@@ -6,7 +6,7 @@ Imanari is a 0.1 developer preview. Only the latest commit on `main` receives fi
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem. Report it through GitHub's private vulnerability reporting: go to the repository's **Security** tab and choose **Report a vulnerability**. Include the `.nari` source or request that triggers the problem, what you expected, and what happened.
+Please do not open a public issue for a security problem. Report it through GitHub's private vulnerability reporting: go to the repository's **Security** tab and choose **Report a vulnerability**. Include the `.nr` source or request that triggers the problem, what you expected, and what happened.
 
 You should get an acknowledgement within a week. Once a fix is ready, it is published with an advisory that credits the reporter, unless you ask not to be named.
 

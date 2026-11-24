@@ -1,6 +1,6 @@
 # Imanari
 
-Imanari is a small, human-readable system language. A `.nari` file declares data, owner-scoped actions, screens, runtime limits, recovery policy, and repair authority. The compiler turns it into a native Rust backend (Axum + SQLx on SQLite or PostgreSQL), a browser UI built from native controls, a typed IR, and a dependency graph. Agents work from bounded, versioned context bundles instead of reconstructing the project from chat history.
+Imanari is a small, human-readable system language. A `.nr` file declares data, owner-scoped actions, screens, runtime limits, recovery policy, and repair authority. The compiler turns it into a native Rust backend (Axum + SQLx on SQLite or PostgreSQL), a browser UI built from native controls, a typed IR, and a dependency graph. Agents work from bounded, versioned context bundles instead of reconstructing the project from chat history.
 
 New to the language? Start with [the guide](docs/guide.md), which builds a hello-world app and explains every block. Its [web version](https://alibek10599.github.io/imanari-website/guide.html) has playgrounds you can edit in the browser.
 
@@ -86,7 +86,7 @@ From the repository root:
 
 ```sh
 mkdir /tmp/fw && cp -R examples/fieldwork/. /tmp/fw/
-sed -i '' 's/set = { completed: true };/set = { completed: false };/' /tmp/fw/fieldwork.nari
+sed -i '' 's/set = { completed: true };/set = { completed: false };/' /tmp/fw/fieldwork.nr
 nari --project /tmp/fw test                                  # protected test fails; prints the incident id
 nari --project /tmp/fw repair <incident> --proposer fixture  # reproduce, propose, validate in Seatbelt; source untouched
 nari --project /tmp/fw apply-repair <incident> --candidate <hash>

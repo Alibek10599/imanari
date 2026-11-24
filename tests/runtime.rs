@@ -572,7 +572,7 @@ fn rust_compile_errors_map_back_to_imanari_spans() {
         .find(|d| d.code == "E_BACKEND_COMPILE")
         .unwrap();
     assert_eq!(d.node_id.as_deref(), Some("fieldwork/action/complete_task"));
-    assert_eq!(d.file, "fieldwork.nari");
+    assert_eq!(d.file, "fieldwork.nr");
     assert_eq!(
         &FIXTURE[d.span.start..d.span.start + 22],
         "action complete_task {"

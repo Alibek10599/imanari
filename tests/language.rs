@@ -1,8 +1,8 @@
 use imanari::diag::Diagnostic;
 use imanari::{compile, format_source, ir};
 
-const FIXTURE: &str = include_str!("../examples/fieldwork/fieldwork.nari");
-const FILE: &str = "fieldwork.nari";
+const FIXTURE: &str = include_str!("../examples/fieldwork/fieldwork.nr");
+const FILE: &str = "fieldwork.nr";
 
 fn errors(src: &str) -> Vec<Diagnostic> {
     match compile(src, FILE) {
@@ -576,8 +576,8 @@ fn init_creates_a_checked_project_and_never_overwrites() {
             .unwrap()
     };
     assert!(run(&["init", "demo_app"]).status.success());
-    let src = std::fs::read_to_string(dir.join("demo_app/demo_app.nari")).unwrap();
-    assert!(compile(&src, "demo_app.nari").is_ok());
+    let src = std::fs::read_to_string(dir.join("demo_app/demo_app.nr")).unwrap();
+    assert!(compile(&src, "demo_app.nr").is_ok());
     assert!(dir.join("demo_app/acceptance/complete_task.json").exists());
     let again = run(&["init", "demo_app"]);
     assert_eq!(again.status.code(), Some(3));
@@ -586,12 +586,9 @@ fn init_creates_a_checked_project_and_never_overwrites() {
 
 #[test]
 fn hello_example_compiles_and_is_formatted() {
-    let src = include_str!("../examples/hello/hello.nari");
-    let (c, warnings) = compile(src, "hello.nari").expect("hello compiles");
+    let src = include_str!("../examples/hello/hello.nr");
+    let (c, warnings) = compile(src, "hello.nr").expect("hello compiles");
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(c.app.name, "hello");
-    assert_eq!(
-        format_source(src, "hello.nari").expect("hello formats"),
-        src
-    );
+    assert_eq!(format_source(src, "hello.nr").expect("hello formats"), src);
 }

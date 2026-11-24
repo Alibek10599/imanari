@@ -74,7 +74,7 @@ pub fn classify_path(file: &str, project_file: &str) -> Result<(), Rejected> {
     if normalized.starts_with(".nari/") {
         return forbidden("generated artifacts are not canonical source");
     }
-    forbidden("only the project's .nari source may be edited")
+    forbidden("only the project's .nr source may be edited")
 }
 
 pub fn apply_text(p: &Patch, project_file: &str, src: &str) -> Result<String, Rejected> {
