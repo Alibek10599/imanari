@@ -6,7 +6,7 @@ The [web version of this guide](https://alibek10599.github.io/imanari-website/gu
 
 ## What a program is
 
-An Imanari program is one `.nari` file that declares a whole app. You do not write handlers, SQL or page templates. You declare:
+An Imanari program is one `.nr` file that declares a whole app. You do not write handlers, SQL or page templates. You declare:
 
 - **Entities**: the records the app stores, and which field names their owner.
 - **Actions**: the only operations that touch those records. An action inserts a record, lists records, or updates one.
@@ -40,7 +40,7 @@ nari --version
 
 ## Hello, world
 
-Imanari has no `print`. The smallest useful program is an app that stores a line of text for the signed-in user and shows it back. This is [examples/hello/hello.nari](../examples/hello/hello.nari):
+Imanari has no `print`. The smallest useful program is an app that stores a line of text for the signed-in user and shows it back. This is [examples/hello/hello.nr](../examples/hello/hello.nr):
 
 ```nari
 imanari "0.1";
@@ -147,16 +147,16 @@ Read it top to bottom:
 
 ## Run it
 
-Put the program in a directory of its own. A project is a directory with exactly one `.nari` file.
+Put the program in a directory of its own. A project is a directory with exactly one `.nr` file.
 
 ```sh
 mkdir hello && cd hello
-curl -fsSLO https://raw.githubusercontent.com/Alibek10599/imanari/main/examples/hello/hello.nari
+curl -fsSLO https://raw.githubusercontent.com/Alibek10599/imanari/main/examples/hello/hello.nr
 nari check
 nari dev
 ```
 
-`nari check` validates the file offline and prints `ok: hello.nari is valid`. `nari dev` builds the app, starts it under a supervisor, and prints a line like this:
+`nari check` validates the file offline and prints `ok: hello.nr is valid`. `nari dev` builds the app, starts it under a supervisor, and prints a line like this:
 
 ```
 open: http://127.0.0.1:7332/#bootstrap=…
@@ -430,8 +430,8 @@ Each step calls an action as user `a` or `b`. `expect.data` is a subset match. `
 Diagnostics name the file, line and column, an error code, and the id of the declaration at fault:
 
 ```
-hello.nari:37:14: error E_TYPE: input 'text' is Text but field 'owner' is UUID (no implicit casts) [hello/action/say]
-hello.nari:63:17: error E_UNRESOLVED: entity Greeting has no field 'txt' [hello/screen/home/list/said]
+hello.nr:37:14: error E_TYPE: input 'text' is Text but field 'owner' is UUID (no implicit casts) [hello/action/say]
+hello.nr:63:17: error E_UNRESOLVED: entity Greeting has no field 'txt' [hello/screen/home/list/said]
 ```
 
 The first came from assigning `owner: @input.text`. The second came from a list that asked for a field the entity does not have. `nari check --json` gives the same information with byte spans for editors and agents.

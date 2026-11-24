@@ -8,7 +8,7 @@ use serde_json::json;
 const TARGET: &str = "fieldwork/action/complete_task";
 
 fn compiled(src: &str) -> imanari::ir::Compiled {
-    imanari::compile(src, "fieldwork.nari").unwrap().0
+    imanari::compile(src, "fieldwork.nr").unwrap().0
 }
 
 fn set_patch(src: &str, c: &imanari::ir::Compiled, from: &str, to: &str) -> Patch {
@@ -20,7 +20,7 @@ fn set_patch(src: &str, c: &imanari::ir::Compiled, from: &str, to: &str) -> Patc
         affected_nodes: vec![TARGET.into()],
         allowed_scope: vec![TARGET.into()],
         edits: vec![Edit {
-            file: "fieldwork.nari".into(),
+            file: "fieldwork.nr".into(),
             start,
             end: start + from.len(),
             replacement: to.into(),
@@ -139,7 +139,7 @@ fn patch_preconditions_and_scope_are_enforced() {
         "set = { completed: true };",
         "set = { completed: false };",
     );
-    let applied = patch::apply_text(&good, "fieldwork.nari", FIXTURE).unwrap();
+    let applied = patch::apply_text(&good, "fieldwork.nr", FIXTURE).unwrap();
     let cand = compiled(&applied);
     assert_eq!(
         patch::check_scope(&c, &cand, &good.allowed_scope).unwrap(),
@@ -148,7 +148,7 @@ fn patch_preconditions_and_scope_are_enforced() {
 
     let edited = FIXTURE.replace("app fieldwork {", "// a comment-only edit\napp fieldwork {");
     assert_eq!(
-        patch::apply_text(&good, "fieldwork.nari", &edited)
+        patch::apply_text(&good, "fieldwork.nr", &edited)
             .unwrap_err()
             .code,
         "PATCH_STALE"
@@ -158,15 +158,15 @@ fn patch_preconditions_and_scope_are_enforced() {
         "acceptance/complete_task.json",
         "Cargo.toml",
         "Cargo.lock",
-        "../fieldwork.nari",
+        "../fieldwork.nr",
         "/etc/passwd",
         ".nari/generated/app/src/main.rs",
-        "other.nari",
+        "other.nr",
     ] {
         let mut p = good.clone();
         p.edits[0].file = file.into();
         assert_eq!(
-            patch::apply_text(&p, "fieldwork.nari", FIXTURE)
+            patch::apply_text(&p, "fieldwork.nr", FIXTURE)
                 .unwrap_err()
                 .code,
             "PATCH_PATH_FORBIDDEN",
@@ -176,8 +176,8 @@ fn patch_preconditions_and_scope_are_enforced() {
 
     let scope = |from: &str, to: &str| {
         let p = set_patch(FIXTURE, &c, from, to);
-        let text = patch::apply_text(&p, "fieldwork.nari", FIXTURE).unwrap();
-        match imanari::compile(&text, "fieldwork.nari") {
+        let text = patch::apply_text(&p, "fieldwork.nr", FIXTURE).unwrap();
+        match imanari::compile(&text, "fieldwork.nr") {
             Ok((cand, _)) => {
                 patch::check_scope(&c, &cand, &p.allowed_scope)
                     .unwrap_err()
@@ -327,10 +327,10 @@ fn task_record_resumes_only_when_hashes_and_evidence_match() {
 fn macos_metadata_files_are_ignored_by_project_discovery() {
     let p = write_project("appledouble", FIXTURE);
     let junk = [0u8, 5, 22, 7, 0, 2, 0, 0];
-    std::fs::write(p.dir.join("._fieldwork.nari"), junk).unwrap();
+    std::fs::write(p.dir.join("._fieldwork.nr"), junk).unwrap();
     std::fs::write(p.dir.join("acceptance/._complete_task.json"), junk).unwrap();
     let located = imanari::Project::locate(Some(p.dir.clone())).unwrap();
-    assert_eq!(located.file_name, "fieldwork.nari");
+    assert_eq!(located.file_name, "fieldwork.nr");
     let tests = imanari::testrun::load_protected(&p.dir).unwrap();
     assert_eq!(tests.len(), 3);
 }

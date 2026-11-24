@@ -52,12 +52,12 @@ impl Project {
             .map_err(|e| format!("cannot read project directory {}: {e}", dir.display()))?
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "nari") && p.is_file() && !is_hidden(p))
+            .filter(|p| p.extension().is_some_and(|x| x == "nr") && p.is_file() && !is_hidden(p))
             .collect();
         files.sort();
         if files.len() != 1 {
             return Err(format!(
-                "expected exactly one .nari file in {}, found {}",
+                "expected exactly one .nr file in {}, found {}",
                 dir.display(),
                 files.len()
             ));

@@ -99,13 +99,13 @@ fn compiler(out: &Path, runs: usize) -> Result<Json, String> {
     let src = big_source(n);
     let dir = out.join("compiler");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::write(dir.join("bench.nari"), &src).map_err(|e| e.to_string())?;
+    fs::write(dir.join("bench.nr"), &src).map_err(|e| e.to_string())?;
     let p = Project::locate(Some(dir.clone()))?;
     let mut check = Vec::new();
     let mut semantic = None;
     for i in 0..=runs {
         let t = Instant::now();
-        let (c, _) = crate::compile(&src, "bench.nari")
+        let (c, _) = crate::compile(&src, "bench.nr")
             .map_err(|d| format!("1000-action fixture failed to compile: {}", d[0].render()))?;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         if c.app.actions.len() != n {
@@ -121,7 +121,7 @@ fn compiler(out: &Path, runs: usize) -> Result<Json, String> {
             check.push(ms);
         }
     }
-    let (c, _) = crate::compile(&src, "bench.nari").map_err(|_| "compile failed")?;
+    let (c, _) = crate::compile(&src, "bench.nr").map_err(|_| "compile failed")?;
     let target = "bench/action/a2";
     let mut ctx = Vec::new();
     let mut bytes = 0;
@@ -478,8 +478,8 @@ fn runtime(
     runs: usize,
 ) -> Result<Json, String> {
     let fixture = crate::compile(
-        include_str!("../examples/fieldwork/fieldwork.nari"),
-        "fieldwork.nari",
+        include_str!("../examples/fieldwork/fieldwork.nr"),
+        "fieldwork.nr",
     )
     .map_err(|_| "fixture")?
     .0;
@@ -691,8 +691,8 @@ fn kernel(c: &Compiled, p: &Project, out: &Path, quick: bool, runs: usize) -> Re
 
 fn agent_iteration(p: &Project, c: &Compiled, out: &Path) -> Result<Json, String> {
     let fixture = crate::compile(
-        include_str!("../examples/fieldwork/fieldwork.nari"),
-        "fieldwork.nari",
+        include_str!("../examples/fieldwork/fieldwork.nr"),
+        "fieldwork.nr",
     )
     .map_err(|_| "fixture")?
     .0;

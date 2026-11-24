@@ -10,7 +10,7 @@ labels: bug
 
 **Steps to reproduce**
 
-Paste the smallest `.nari` source that reproduces it, and the commands you ran (for example `nari --json check`).
+Paste the smallest `.nr` source that reproduces it, and the commands you ran (for example `nari --json check`).
 
 **Output**
 

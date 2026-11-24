@@ -20,7 +20,7 @@ Imanari is a standalone project. It MUST have its own Cargo workspace, lockfile,
 
 ### 0.1: runnable local vertical slice
 
-Implement a real `.nari` parser, semantic checks, canonical intermediate representation (IR), Rust backend generation, a browser frontend, SQLite persistence, local development identity, context extraction, structured diagnostics, bounded process recovery, incident memory, and a reproducible isolated repair demonstration.
+Implement a real `.nr` parser, semantic checks, canonical intermediate representation (IR), Rust backend generation, a browser frontend, SQLite persistence, local development identity, context extraction, structured diagnostics, bounded process recovery, incident memory, and a reproducible isolated repair demonstration.
 
 The reference application is Fieldwork: two users can create, list, and complete their own tasks. The complete operation checks a record revision to prevent lost updates. A worker can crash and recover without losing committed tasks. A seeded bug can be reproduced, patched in an isolated workspace, validated, and recorded. No live LLM account is required to run the acceptance suite.
 
@@ -51,7 +51,7 @@ Dependencies and the operating system may contain unsafe code; forbidding it in 
 
 ### 5.1 Syntax
 
-`fieldwork.nari` accompanying this document is the normative positive fixture. Earlier conversational examples were sketches and are superseded by this grammar.
+`fieldwork.nr` accompanying this document is the normative positive fixture. Earlier conversational examples were sketches and are superseded by this grammar.
 
 ```ebnf
 document    = "imanari", string, ";", "app", identifier, "{", entry*, "}" ;
@@ -223,7 +223,7 @@ These are roadmap contracts, not 0.1 implementation requirements. Version 0.3 im
 
 ## 11. CLI contract
 
-All commands accept `--project PATH` and `--json`; default project is the current directory containing exactly one `.nari` file. Human output is concise. JSON diagnostics contain `code`, `severity`, `message`, `node_id`, `file`, `span`, and `details`. Exit codes: 0 success, 1 validation/check failure, 2 usage/unsupported feature, 3 execution/environment failure, 4 stale precondition or policy rejection. Do not leak secrets in JSON mode.
+All commands accept `--project PATH` and `--json`; default project is the current directory containing exactly one `.nr` file. Human output is concise. JSON diagnostics contain `code`, `severity`, `message`, `node_id`, `file`, `span`, and `details`. Exit codes: 0 success, 1 validation/check failure, 2 usage/unsupported feature, 3 execution/environment failure, 4 stale precondition or policy rejection. Do not leak secrets in JSON mode.
 
 | Command | Required behavior |
 | --- | --- |

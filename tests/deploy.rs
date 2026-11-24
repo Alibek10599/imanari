@@ -238,7 +238,7 @@ fn docker_blue_green_releases_switch_without_dropping_requests() {
     let r = nari(&dir, &["release", &h1], &[]);
     assert_eq!(failure(&r), (Some(4), "E_DRIFT"));
 
-    let src = dir.join("fieldwork.nari");
+    let src = dir.join("fieldwork.nr");
     let v2 = FIXTURE.replace(
         "    field completed {",
         "    field notes {\n      type = Text;\n      default = \"from v2\";\n    }\n\n    field completed {",

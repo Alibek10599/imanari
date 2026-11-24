@@ -10,7 +10,7 @@ Acceptance impact: none. Item 4's input-limit check asserts 413, and the rate li
 
 ## D2 Protected tests are JSON scenarios in `acceptance/`
 
-The grammar has no test syntax, and unknown blocks are errors (§5.1). Protected tests are therefore data files outside the `.nari` source: declarative HTTP steps with subset expectations. They are hashed into context, repair snapshots, and candidates, and the repair path policy forbids edits to `acceptance/`.
+The grammar has no test syntax, and unknown blocks are errors (§5.1). Protected tests are therefore data files outside the `.nr` source: declarative HTTP steps with subset expectations. They are hashed into context, repair snapshots, and candidates, and the repair path policy forbids edits to `acceptance/`.
 
 Acceptance impact: items 8 and 9 use them as the unchanged protected suite.
 
@@ -74,7 +74,7 @@ The semantic hash covers the typed IR without spans, so comments, formatting and
 
 ## D15 The project is named Imanari and the command is `nari`
 
-"Frame" was already taken by a state-machine language with a Rust compiler on crates.io (frame-lang/framec), by Polkadot's FRAME runtime framework, and by the `frame` crate. The language is now Imanari, after the BJJ roll into a leg entanglement. Day-to-day names use the short form `nari`: the CLI, the `.nari` source extension, the `.nari/` artifact directory, `NARI_*` environment variables, and the `nari-*/0.1` artifact schemas. Crates keep the full name (`imanari`, `imanari-runtime`), and source files open with `imanari "0.1";`. The language version stays 0.1, and the tool moves to 0.2.0 because the command, extension and header changed.
+"Frame" was already taken by a state-machine language with a Rust compiler on crates.io (frame-lang/framec), by Polkadot's FRAME runtime framework, and by the `frame` crate. The language is now Imanari, after the BJJ roll into a leg entanglement. Day-to-day names use the short form `nari`: the CLI, the `.nr` source extension, the `.nari/` artifact directory, `NARI_*` environment variables, and the `nari-*/0.1` artifact schemas. Crates keep the full name (`imanari`, `imanari-runtime`), and source files open with `imanari "0.1";`. The language version stays 0.1, and the tool moves to 0.2.0 because the command, extension and header changed.
 
 Acceptance impact: none. Behavior is unchanged; only names moved.
 

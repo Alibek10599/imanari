@@ -6,7 +6,7 @@ use imanari::launch::{AppProcess, LaunchOptions, Session};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const FIXTURE: &str = include_str!("../../examples/fieldwork/fieldwork.nari");
+pub const FIXTURE: &str = include_str!("../../examples/fieldwork/fieldwork.nr");
 pub const SHARED_TARGET: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/nari-apps");
 
 pub struct Built {
@@ -25,7 +25,7 @@ pub fn scratch(name: &str) -> PathBuf {
 
 pub fn write_project(name: &str, src: &str) -> Project {
     let dir = scratch(name);
-    std::fs::write(dir.join("fieldwork.nari"), src).unwrap();
+    std::fs::write(dir.join("fieldwork.nr"), src).unwrap();
     let acceptance = dir.join("acceptance");
     std::fs::create_dir_all(&acceptance).unwrap();
     for entry in std::fs::read_dir(concat!(
